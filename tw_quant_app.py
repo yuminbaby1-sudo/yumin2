@@ -21,15 +21,14 @@ from dataclasses import asdict, dataclass
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from urllib.parse import quote
+import warnings
 from itertools import product
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import requests
-import streamlit as st
 
 # ============================================================================
 # A. 資料來源層
@@ -199,7 +198,7 @@ def load_flags():
 
 
 # ----------------------------------------------------------------------------
-def download_prices(tickers: list[str], period: str = "4y", chunk: int = 100, min_len: int = 120) -> dict:
+def download_prices(tickers: list[str], period: str = "4y", chunk: int = 100, min_len: int = 120, keep_rows: int | None = None) -> dict:
     import yfinance as yf
 
     out = {}
@@ -228,7 +227,8 @@ def download_prices(tickers: list[str], period: str = "4y", chunk: int = 100, mi
                 if df.shape[1] < 5 or len(df) < min_len:
                     continue
                 df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
-                out[t] = df[~df.index.duplicated(keep="last")].sort_index()
+                df = df[~df.index.duplicated(keep="last")].sort_index().astype("float32")
+                out[t] = df.tail(keep_rows) if keep_rows else df
             except Exception:
                 continue
     return out
@@ -243,6 +243,32 @@ def links(code: str, market: str = "TW") -> dict:
         "TradingView": f"https://tw.tradingview.com/chart/?symbol={tv}%3A{code}",
         "公開資訊觀測站": f"https://mops.twse.com.tw/mops/web/t05st01?co_id={code}",
     }
+
+
+STATE_DIR = Path(os.environ.get("STATE_DIR", "."))   # 排程模式把狀態檔放在 state 分支的資料夾
+
+
+def rss_mb() -> float:
+    """目前程序記憶體（MB），只讀 /proc，不需額外套件。"""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+
+def trim_memory():
+    """強制回收並把空閒記憶體還給作業系統（降低長時間執行的碎片化）。"""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -303,7 +329,7 @@ def merge_recent(hist: dict, recent: dict) -> dict:
 
 def is_partial(df: pd.DataFrame, now: dt.datetime | None = None) -> bool:
     now = now or now_tw()
-    return bool(len(df)) and df.index[-1].date() == now.date() and now.time() < dt.time(13, 45)
+    return bool(len(df)) and df.index[-1].date() == now.date() and now.time() < dt.time(14, 0)
 
 
 def closed_only(df: pd.DataFrame) -> pd.DataFrame:
@@ -344,22 +370,42 @@ def send_line(token: str, user_id: str, text: str):
 
 def notify_cfg() -> dict:
     return dict(tg_token=get_secret("TELEGRAM_BOT_TOKEN"), tg_chat=get_secret("TELEGRAM_CHAT_ID"),
-                line_token=get_secret("LINE_CHANNEL_TOKEN"), line_user=get_secret("LINE_USER_ID"))
+                line_token=get_secret("LINE_CHANNEL_TOKEN"), line_user=get_secret("LINE_USER_ID"),
+                line_broadcast=get_secret("LINE_BROADCAST").strip().lower() in ("1", "true", "yes", "y"))
+
+
+PRIVATE_CATS = {"hold"}      # 含成本/損益的持股警示：永遠不廣播給好友
+
+
+def notify_routed(public_text: str, private_text: str, cfg: dict) -> list:
+    """LINE 路由：
+    只填 User ID、沒開廣播 → 全部只傳給你；
+    開廣播 → 公開訊號廣播給所有好友，持股警示仍只傳給你（需 User ID）；
+    沒填 User ID → 公開訊號廣播，持股警示不經 LINE 發送。Telegram 則全部傳給設定的 Chat。"""
+    res, both = [], "\n\n".join(t for t in (public_text, private_text) if t)
+    if cfg.get("tg_token") and cfg.get("tg_chat") and both:
+        res.append(send_telegram(cfg["tg_token"], cfg["tg_chat"], both))
+    if cfg.get("line_token"):
+        user, bc = cfg.get("line_user", ""), cfg.get("line_broadcast", False)
+        if user and not bc:
+            if both:
+                res.append(send_line(cfg["line_token"], user, both))
+        else:
+            if public_text:
+                res.append(send_line(cfg["line_token"], "", public_text))
+            if private_text and user:
+                res.append(send_line(cfg["line_token"], user, private_text))
+    return res
 
 
 def notify_all(text: str, cfg: dict) -> list:
-    res = []
-    if cfg.get("tg_token") and cfg.get("tg_chat"):
-        res.append(send_telegram(cfg["tg_token"], cfg["tg_chat"], text))
-    if cfg.get("line_token"):
-        res.append(send_line(cfg["line_token"], cfg.get("line_user", ""), text))
-    return res
+    return notify_routed(text, "", cfg)
 
 
 # ----------------------------------------------------------------------------
 # 訊號去重（檔案持久化，跨工作階段/重啟不重複推播）
 # ----------------------------------------------------------------------------
-ALERT_FILE = Path("alert_state.json")
+ALERT_FILE = STATE_DIR / "alert_state.json"
 _ALERT_LOCK = threading.Lock()
 
 
@@ -414,11 +460,11 @@ def alert_state_set(name: str, value):
 # 主力（外資+投信）逐日買賣超歷史：FinMind 公開 API（上市櫃皆有）。
 # 有歷史才能「回測」主力因子。可選 FINMIND_TOKEN 提高呼叫上限；本機 CSV 快取、每日增量更新。
 # ----------------------------------------------------------------------------
-INST_FILE = Path("inst_history.csv")
+INST_FILE = STATE_DIR / "inst_history.csv"
 _FM_URL = "https://api.finmindtrade.com/api/v4/data"
 
 
-def load_inst_history(codes, years: int = 4, token: str = ""):
+def load_inst_history(codes, years: int = 4, token: str = "", max_fetch: int = 400):
     msgs = []
     cols = ["date", "code", "foreign", "trust"]
     start = (now_tw().date() - dt.timedelta(days=365 * years + 10)).isoformat()
@@ -428,8 +474,16 @@ def load_inst_history(codes, years: int = 4, token: str = ""):
     except Exception:
         cache = pd.DataFrame(columns=cols)
     last = cache.groupby("code")["date"].max().to_dict() if len(cache) else {}
-    fresh_file = INST_FILE.exists() and dt.datetime.fromtimestamp(INST_FILE.stat().st_mtime, TZ).date() == now_tw().date()
-    todo = [c for c in codes if not (fresh_file and c in last)]
+    marker = STATE_DIR / "inst_refresh.txt"
+    today_s = now_tw().strftime("%Y-%m-%d")
+    try:
+        done_today = marker.exists() and marker.read_text().strip() == today_s
+    except Exception:
+        done_today = False
+    todo = [c for c in codes if not (done_today and c in last)]
+    if len(todo) > max_fetch:
+        msgs.append(f"股票池大於 {max_fetch} 檔：只更新成交值前 {max_fetch} 檔的主力逐日資料，其餘用量價足跡代理。")
+        todo = todo[:max_fetch]
     state = {"limit": False}
 
     def fetch(code):
@@ -466,6 +520,11 @@ def load_inst_history(codes, years: int = 4, token: str = ""):
         cache = pd.concat([cache] + new, ignore_index=True).drop_duplicates(["date", "code"], keep="last")
         try:
             cache.to_csv(INST_FILE, index=False)
+        except Exception:
+            pass
+    if ok and not state["limit"]:
+        try:
+            marker.write_text(today_s)
         except Exception:
             pass
     if state["limit"]:
@@ -509,6 +568,84 @@ def news_counts(items: list):
     pos = sum(any(k in i["title"] for k in NEWS_POS) for i in items)
     neg = sum(any(k in i["title"] for k in NEWS_NEG) for i in items)
     return pos, neg
+
+
+
+# ----------------------------------------------------------------------------
+# 官方收盤價（交叉驗證 yfinance）、盤中成交量外推、資料品質檢查
+# ----------------------------------------------------------------------------
+def load_official_close():
+    out, msgs = {}, []
+    try:
+        for r in _get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL").json():
+            out[str(r.get("Code", "")).strip()] = _num(r.get("ClosingPrice"))
+    except Exception as e:
+        msgs.append(f"官方收盤價（上市）抓取失敗：{e}")
+    try:
+        for r in _get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes").json():
+            ck = next((k for k in r if "Code" in k), None)
+            vk = "Close" if "Close" in r else next((k for k in r if "Close" in k), None)
+            if ck and vk:
+                out[str(r[ck]).strip()] = _num(r[vk])
+    except Exception as e:
+        msgs.append(f"官方收盤價（上櫃）抓取失敗：{e}")
+    return pd.Series(out, dtype=float).dropna(), msgs
+
+
+DATA_DELAY_MIN = 20     # yfinance 台股報價約延遲 15~20 分鐘
+_VOL_CURVE = [(540, 0.0), (570, 0.22), (600, 0.34), (630, 0.44), (660, 0.54), (690, 0.63),
+              (720, 0.72), (750, 0.82), (780, 0.92), (810, 1.0)]     # 台股日內累積成交量比例（經驗曲線）
+
+
+def session_fraction(now: dt.datetime | None = None) -> float:
+    n = (now or now_tw()) - dt.timedelta(minutes=DATA_DELAY_MIN)
+    m = n.hour * 60 + n.minute
+    xs, ys = zip(*_VOL_CURVE)
+    return float(np.clip(np.interp(m, xs, ys), 0.12, 1.0))
+
+
+def project_partial_volume(df: pd.DataFrame) -> pd.DataFrame:
+    """盤中最後一根 K 棒的成交量只是『到目前為止』；依日內曲線外推成全日量，量能因子才不會被低估。"""
+    if not is_partial(df):
+        return df
+    df = df.copy()
+    c = df.columns.get_loc("Volume")
+    df.iloc[-1, c] = df.iloc[-1, c] / session_fraction()
+    return df
+
+
+def validate_prices(prices: dict, official, bench_last):
+    """剔除：資料過舊、成交量過薄、異常跳價(疑似未調整的分割/壞資料)、與官方收盤價不符。"""
+    keep, rep = {}, dict(ok=0, stale=0, thin=0, jump=0, mismatch=0, skipped=False)
+    mism = []
+    for t, df in prices.items():
+        code = t.split(".")[0]
+        if t.startswith("^") or code.startswith("00"):
+            keep[t] = df
+            continue
+        if df.index[-1] < bench_last - pd.Timedelta(days=5):
+            rep["stale"] += 1
+            continue
+        if (df["Volume"].tail(60) == 0).mean() > 0.2:
+            rep["thin"] += 1
+            continue
+        if df["Close"].pct_change().abs().tail(250).max() > 0.25:
+            rep["jump"] += 1
+            continue
+        keep[t] = df
+        if official is not None and code in official.index and pd.notna(official[code]) and official[code] > 0:
+            recent = df["Close"].tail(3).to_numpy(dtype=float)
+            if not np.any(np.abs(recent / float(official[code]) - 1) < 0.015):
+                mism.append(t)
+    checked = max(len(keep), 1)
+    if mism and len(mism) / checked > 0.25:      # 大量不符＝兩邊日期不同步，不是壞資料
+        rep["skipped"] = True
+    else:
+        for t in mism:
+            keep.pop(t, None)
+        rep["mismatch"] = len(mism)
+    rep["ok"] = sum(1 for t in keep if not t.startswith("^") and not t.startswith("00"))
+    return keep, rep
 
 
 # ============================================================================
@@ -659,7 +796,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     dif = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     d["MACD_Hist"] = dif - dif.ewm(span=9, adjust=False).mean()
 
-    # ---- 主力足跡（量價代理；有 FinMind 外資/投信逐日資料時另有真實『主力』因子）----
+    # ---- 大戶/主力足跡（量價代理，可回測；真實法人/大戶資料只用於即時加減分）----
     clv = ((c - l) - (h - c)) / (h - l + 1e-9)
     d["CLV5"] = (clv * v).rolling(5).sum() / (v.rolling(5).sum() + 1e-9)
     d["CMF20"] = (clv * v).rolling(20).sum() / (v.rolling(20).sum() + 1e-9)      # Chaikin 資金流
@@ -713,6 +850,19 @@ PANEL_FIELDS = [
 ]
 
 
+
+def build_panel_stream(dfs: dict, inst: dict, idx) -> dict:
+    """逐檔計算指標、直接寫進 float32 陣列，不保留每檔的完整指標表（大幅降低尖峰記憶體）。"""
+    codes = list(dfs)
+    T, N = len(idx), len(codes)
+    arrs = {f: np.full((T, N), np.nan, dtype=np.float32) for f in PANEL_FIELDS}
+    for j, code in enumerate(codes):
+        d = attach_inst(add_indicators(dfs[code]), inst.get(code)).reindex(idx)
+        for f in PANEL_FIELDS:
+            arrs[f][:, j] = d[f].to_numpy(dtype=np.float32)
+    return {f: pd.DataFrame(a, index=idx, columns=codes) for f, a in arrs.items()}
+
+
 def build_panel(stock_dfs: dict) -> dict:
     """code -> indicator df  ==>  field -> DataFrame(date x code)"""
     P = {}
@@ -726,19 +876,20 @@ def build_panel(stock_dfs: dict) -> dict:
 # ----------------------------------------------------------------------------
 def sector_strength(mb: pd.DataFrame, groups: dict) -> pd.DataFrame:
     """族群強弱：各產業『成員動能平均』的橫斷面百分位，回填給每檔成員（≥3 檔的族群才計算）。"""
-    out = pd.DataFrame(0.5, index=mb.index, columns=mb.columns)
-    if not groups:
-        return out
-    gmap = pd.Series({c: groups.get(c, "其他") or "其他" for c in mb.columns})
-    members = {g: list(cols) for g, cols in gmap.groupby(gmap).groups.items() if len(cols) >= 3}
-    if len(members) < 3:
-        return out
-    gm = pd.DataFrame({g: mb[cols].mean(axis=1) for g, cols in members.items()})
-    rk = gm.rank(axis=1, pct=True)
-    for g, cols in members.items():
-        for c in cols:
-            out[c] = rk[g]
-    return out
+    T, N = mb.shape
+    out = np.full((T, N), 0.5, dtype=np.float32)
+    if groups:
+        gmap = pd.Series({c: (groups.get(c, "其他") or "其他") for c in mb.columns})
+        members = {g: [mb.columns.get_loc(c) for c in cols] for g, cols in gmap.groupby(gmap).groups.items() if len(cols) >= 3}
+        if len(members) >= 3:
+            arr = mb.to_numpy(dtype=np.float32)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                gm = pd.DataFrame({g: np.nanmean(arr[:, ix], axis=1) for g, ix in members.items()}, index=mb.index)
+            rk = gm.rank(axis=1, pct=True)
+            for g, ix in members.items():
+                out[:, ix] = rk[g].to_numpy(dtype=np.float32)[:, None]
+    return pd.DataFrame(out, index=mb.index, columns=mb.columns)
 
 
 def compute_features(P: dict, bench_close: pd.Series, groups: dict | None = None) -> dict:
@@ -767,7 +918,7 @@ def compute_features(P: dict, bench_close: pd.Series, groups: dict | None = None
     pullback = ((P["MA20_slope5"] > 0) & (P["Bias10"].abs() <= 2.0) & (P["RSI"] >= 42) & (P["RSI"] <= 62)
                 & (P["Volume"] < P["Vol_MA5"] * 0.9) & (C > P["MA20"])).astype(float)
     f["setup"] = np.maximum(breakout, 0.8 * pullback)
-    return f
+    return {k: v.astype(np.float32) for k, v in f.items()}
 
 
 def composite_score(feats: dict, preset: str) -> pd.DataFrame:
@@ -835,15 +986,22 @@ def regime_levels(bench_close: pd.Series, idx, P: dict):
     return lvl.to_numpy().astype(int), breadth
 
 
+CORE_FIELDS = ("Open", "High", "Low", "Close", "Volume", "ATR", "Low5")
+
+
 class Engine:
+    """輕量化引擎：完整歷史只保留回測/預測力檢驗必需的欄位；其餘指標只留最近 130 根供顯示。"""
+
     def __init__(self, P: dict, bench_close: pd.Series, flt: Filters, costs: Costs, capital: float = 1_000_000.0,
                  risk_frac: float = 0.015, groups: dict | None = None, sleeve_close: pd.Series | None = None):
-        self.P, self.flt, self.costs, self.capital, self.risk_frac = P, flt, costs, capital, risk_frac
+        self.costs, self.capital, self.risk_frac, self.flt = costs, capital, risk_frac, flt
         self.idx = P["Close"].index
         self.codes = list(P["Close"].columns)
         self.groups = groups or {}
-        self.feats = compute_features(P, bench_close, self.groups)
-        self.scores = {k: composite_score(self.feats, k) for k in PRESETS}
+        feats = compute_features(P, bench_close, self.groups)
+        self.scores = {k: composite_score(feats, k).astype(np.float32) for k in PRESETS}
+        self.feats = {k: v.tail(5) for k, v in feats.items()}
+        del feats
         self.elig_by_heat = {}
         for h, (b5, b20) in HEATS.items():
             lq, el = universe_masks(P, Filters(flt.min_price, flt.min_turnover, flt.min_amp, b5, b20))
@@ -855,11 +1013,12 @@ class Engine:
         sc = sleeve_close if sleeve_close is not None else bench_close
         self.sleeve = sc.reindex(self.idx).ffill().bfill()
         self.sleeve_ret = self.sleeve.pct_change().fillna(0.0).to_numpy()
-        C = P["Close"]
-        self.arr = dict(O=P["Open"].to_numpy(), H=P["High"].to_numpy(), L=P["Low"].to_numpy(),
-                        C=C.to_numpy(), Cf=C.ffill().to_numpy(), ATR=P["ATR"].to_numpy(),
-                        LOW5=P["Low5"].to_numpy())
+        f64 = lambda k: P[k].to_numpy(dtype=np.float64)
+        self.arr = dict(O=f64("Open"), H=f64("High"), L=f64("Low"), C=f64("Close"),
+                        Cf=P["Close"].ffill().to_numpy(dtype=np.float64), ATR=f64("ATR"), LOW5=f64("Low5"))
+        self.P = {k: (v if k in CORE_FIELDS else v.tail(130)) for k, v in P.items()}
         self._rank_cache = {}
+        self._memo = {}
 
     def ranks(self, preset: str, min_score: float, heat: str = "中", topk: int = 6):
         key = (preset, float(min_score), heat, topk)
@@ -870,6 +1029,13 @@ class Engine:
             order = np.argsort(-filled, axis=1)[:, :topk]
             self._rank_cache[key] = (order, np.take_along_axis(S, order, axis=1))
         return self._rank_cache[key]
+
+
+def eng_memo(eng: Engine, key, fn):
+    """重運算（快照、預測力、校準、族群表）只算一次，頁面重繪不再重算。"""
+    if key not in eng._memo:
+        eng._memo[key] = fn()
+    return eng._memo[key]
 
 
 def bench_window(eng: Engine, a: int, b: int):
@@ -1529,7 +1695,7 @@ SCREEN_FLAGS = [
 
 
 def snapshot(eng: Engine, preset: str) -> pd.DataFrame:
-    P = eng.P
+    P = {k: v.tail(130) for k, v in eng.P.items()}
     C = P["Close"]
 
     def cross(a, b, k=3):
@@ -1643,7 +1809,7 @@ SECTORS = {
 NAME_MAP = {c: n for v in SECTORS.values() for c, n, _ in v}
 TAG_MAP = {c: t for v in SECTORS.values() for c, _, t in v}
 
-PORTFOLIO_FILE = Path("portfolio.json")
+PORTFOLIO_FILE = STATE_DIR / "portfolio.json"
 DEFAULT_PORTFOLIO = [
     {"code": "2330", "cost": 950.0, "shares": 1000, "date": "2026-09-15"},
     {"code": "3189", "cost": 115.0, "shares": 5000, "date": "2026-09-20"},
@@ -1653,21 +1819,30 @@ DEFAULT_PORTFOLIO = [
 
 
 def load_portfolio() -> list:
+    env = os.environ.get("PORTFOLIO_JSON", "").strip()
+    if env:
+        try:
+            return json.loads(env)
+        except Exception:
+            pass
     try:
         return json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return [dict(x) for x in DEFAULT_PORTFOLIO]
+        return [] if os.environ.get("TQ_HEADLESS") else [dict(x) for x in DEFAULT_PORTFOLIO]
 
 
 def save_portfolio(rows: list):
     PORTFOLIO_FILE.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-WATCHLIST_FILE = Path("watchlist.json")
-BEST_PARAMS_FILE = Path("best_params.json")
+WATCHLIST_FILE = STATE_DIR / "watchlist.json"
+BEST_PARAMS_FILE = STATE_DIR / "best_params.json"
 
 
 def load_watchlist() -> list:
+    env = os.environ.get("WATCHLIST", "").strip()
+    if env:
+        return [c for c in re.split(r"[\s,，、]+", env) if c]
     try:
         return [str(x).strip() for x in json.loads(WATCHLIST_FILE.read_text(encoding="utf-8")) if str(x).strip()]
     except Exception:
@@ -1686,9 +1861,24 @@ def save_best_params(p: Params, level: str = ""):
         pass
 
 
-def load_best_params():
+def fetch_state_json(name: str):
+    """本機狀態檔 → 失敗則讀 STATE_BASE_URL（例如 state 分支的 raw 網址）。"""
     try:
-        raw = json.loads(BEST_PARAMS_FILE.read_text(encoding="utf-8"))
+        return json.loads((STATE_DIR / name).read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    base = get_secret("STATE_BASE_URL")
+    if base:
+        try:
+            return requests.get(base.rstrip("/") + "/" + name, timeout=15).json()
+        except Exception:
+            pass
+    return None
+
+
+def load_best_params(fetch=None):
+    raw = fetch("best_params.json") if fetch else fetch_state_json("best_params.json")
+    try:
         p = Params(**{k: raw[k] for k in Params.__dataclass_fields__ if k in raw})
         return p if (p.preset in PRESETS and p.heat in HEATS) else None   # 舊版存檔的參數名稱不相容時忽略
     except Exception:
@@ -1702,10 +1892,12 @@ def load_meta_core(hour_key: str) -> dict:
     chips, chip_days, m3 = load_institutional(5)
     rev, m4 = load_revenue_yoy()
     punish, notice, m5 = load_flags()
+    official, m8 = load_official_close()
     if uni.empty and markets:     # 官方 ISIN 清單失敗時，用名稱來源重建清單
         uni = pd.DataFrame([dict(code=c, name=names.get(c, c), market=m, industry="") for c, m in markets.items()])
     return dict(uni=uni, turn=turn, names=names, markets=markets, chips=chips, chip_days=chip_days,
-                rev=rev, punish=punish, notice=notice, msgs=m1 + m6 + m2 + m3 + m4 + m5)
+                rev=rev, punish=punish, notice=notice, official=official,
+                msgs=m1 + m6 + m2 + m3 + m4 + m5 + m8)
 
 
 def build_name_market(meta: dict):
@@ -1718,7 +1910,7 @@ def build_name_market(meta: dict):
 
 
 def build_engine_core(meta, n, excl, min_price, min_turn_yi, min_amp, b5, b20, fee_disc, slip_pct,
-                      risk_frac, use_intraday, get_prices_fn, inst_fn=None):
+                      risk_frac, use_intraday, get_prices_fn, inst_fn=None, keep_rows=None):
     uni, notes = meta["uni"].copy(), []
     if not uni.empty:
         uni = uni[~uni["code"].str.startswith("00")]      # 排除 ETF
@@ -1739,7 +1931,13 @@ def build_engine_core(meta, n, excl, min_price, min_turn_yi, min_amp, b5, b20, f
     sleeve = prices.pop("0050.TW", None)
     if bench is None or not prices:
         raise RuntimeError("價格資料下載失敗（yfinance）。請稍後重試或檢查網路。")
-    if not use_intraday:
+    prices, rep = validate_prices(prices, meta.get("official"), bench.index[-1])
+    notes.append(f"資料品質檢查：通過 {rep['ok']} 檔；剔除 過舊{rep['stale']}／成交量過薄{rep['thin']}／異常跳價{rep['jump']}／"
+                 f"與官方收盤價不符{rep['mismatch']}" + ("（官方與 yfinance 日期不同步，已略過官方比對）" if rep["skipped"] else ""))
+    if use_intraday:
+        prices = {t: project_partial_volume(df) for t, df in prices.items()}
+        notes.append(f"盤中模式：最後一根 K 棒成交量已依日內曲線外推（目前約 {session_fraction()*100:.0f}% 的全日量）。")
+    else:
         prices = {t: closed_only(df) for t, df in prices.items()}
         bench = closed_only(bench)
         sleeve = closed_only(sleeve) if sleeve is not None else None
@@ -1752,18 +1950,15 @@ def build_engine_core(meta, n, excl, min_price, min_turn_yi, min_amp, b5, b20, f
         except Exception as e:
             imsgs = [f"主力逐日資料取得失敗：{e}（改用量價足跡代理）"]
     notes += imsgs
-    dfs = {}
-    for t, df in prices.items():
-        try:
-            code = t.split(".")[0]
-            dfs[code] = attach_inst(add_indicators(df), inst.get(code))
-        except Exception:
-            continue
-    P = build_panel(dfs)
+    idx = bench.index[-keep_rows:] if keep_rows else bench.index
+    dfs = {t.split(".")[0]: df for t, df in prices.items()}
+    P = build_panel_stream(dfs, inst, idx)
     groups = dict(zip(uni["code"], uni["industry"])) if "industry" in uni else {}
     flt = Filters(min_price, min_turn_yi * 1e8, min_amp, b5, b20)
     eng = Engine(P, bench["Close"], flt, Costs(fee_disc=fee_disc, slip=slip_pct / 100.0), risk_frac=risk_frac,
                  groups=groups, sleeve_close=sleeve["Close"] if sleeve is not None else None)
+    del prices, dfs, P
+    trim_memory()
     return eng, bench, notes
 
 
@@ -1898,63 +2093,151 @@ def dispatch_alerts(alerts: list, cfg: dict, enabled=None):
     fresh = [a for a in sel if a.key in fresh_keys]
     if not fresh:
         return "沒有新的訊號（已推送過的不會重複）。", []
-    text = f"📡 台股量化訊號 {now_tw():%m/%d %H:%M}\n\n" + "\n\n".join(a.text for a in fresh)
-    res = notify_all(text, cfg)
+    head = f"📡 台股量化訊號 {now_tw():%m/%d %H:%M}\n\n"
+    pub = "\n\n".join(a.text for a in fresh if a.cat not in PRIVATE_CATS)
+    pri = "\n\n".join(a.text for a in fresh if a.cat in PRIVATE_CATS)
+    res = notify_routed(head + pub if pub else "", ("🔒 持股警示\n\n" + pri) if pri else "", cfg)
     if not any(ok for ok, _ in res):
         alert_release(list(fresh_keys))
-    return "；".join(m for _, m in res) or "無推播結果", fresh
+    return "；".join(m for _, m in res) or "無推播結果（LINE 未設定 User ID 時，持股警示不會經 LINE 發送）", fresh
 
 
 # ----------------------------------------------------------------------------
-# 背景常駐模式（瀏覽器關閉也能推播）：python tw_quant_app.py --daemon
-# 環境變數：TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / LINE_CHANNEL_TOKEN / LINE_USER_ID
-#          CAPITAL / RISK_PCT / N_UNIVERSE / CHIP_WEIGHT / USE_INTRADAY
-# 參數取自 best_params.json（在網頁跑完 Walk-Forward 會自動寫入），否則用預設參數。
+# 排程 / 常駐模式（不啟動網頁，可在 GitHub Actions 或任何主機跑，記憶體不受 1GB 限制）
+#   python tw_quant_app.py --scan-once   掃描寬股票池、推播新訊號、寫 latest_scan.json
+#   python tw_quant_app.py --wf-once     重跑 Walk-Forward，寫 best_params.json / wf_summary.json
+#   python tw_quant_app.py --daemon      本機常駐：交易時段每 20 分鐘 scan
+# 環境變數：TELEGRAM_BOT_TOKEN/CHAT_ID、LINE_CHANNEL_TOKEN/LINE_USER_ID/LINE_BROADCAST、FINMIND_TOKEN、
+#          N_UNIVERSE(預設1200)、N_BT(預設300)、CAPITAL、RISK_PCT、CHIP_WEIGHT、NEWS_WEIGHT、OBJ_MODE、
+#          STATE_DIR（狀態檔資料夾）、WATCHLIST（逗號分隔代碼）、PORTFOLIO_JSON
 # ----------------------------------------------------------------------------
-def daemon_main():
+SCAN_EXCL = ["金融保險業", "航運業", "水泥工業"]
+
+
+def in_trading_window(now: dt.datetime) -> bool:
+    return now.weekday() < 5 and dt.time(8, 50) <= now.time() <= dt.time(14, 30)
+
+
+def in_session(now: dt.datetime) -> bool:
+    return now.weekday() < 5 and dt.time(8, 55) <= now.time() < dt.time(14, 10)
+
+
+def write_latest_scan(eng, params, ctx, names, notes):
+    cands = latest_candidates(eng, params, top=30, exclude=ctx["punish"], chip_fn=ctx["chip_fn"])
+    sc = eng.scores[params.preset].iloc[-1]
+    n_ok = int((eng.elig_by_heat[params.heat].iloc[-1] & (sc >= params.min_score)).sum())
+    rows = [dict(code=c["code"], name=names.get(c["code"], ""), group=c["group"], final=round(c["final"], 1),
+                 tech=round(c["score"], 1), main=round(c["bonus"], 1), close=round(c["close"], 2), pct=round(c["pct"], 2),
+                 stop=c["stop"], tp=None if np.isinf(c["tp"]) else c["tp"], risk=round(c["risk_pct"], 2),
+                 turnover=round(c["turnover_yi"], 2)) for c in cands]
+    payload = dict(updated=now_tw().isoformat(timespec="minutes"), data_date=eng.idx[-1].strftime("%Y-%m-%d"),
+                   universe=len(eng.codes), eligible=n_ok, regime=int(eng.regime_lvl[-1]), params=params.label(),
+                   notes=notes[:6], candidates=rows)
+    try:
+        (STATE_DIR / "latest_scan.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def run_scan_cycle(get_prices_fn, meta_fn, inst_fn, news_loader):
+    now = now_tw()
     cfg = notify_cfg()
+    n = int(os.environ.get("N_UNIVERSE", "1200"))
     cap = float(os.environ.get("CAPITAL", "1000000"))
     rp = float(os.environ.get("RISK_PCT", "1.5"))
-    n = int(os.environ.get("N_UNIVERSE", "200"))
-    chip_w = float(os.environ.get("CHIP_WEIGHT", "1"))
-    use_intraday = os.environ.get("USE_INTRADAY", "0") == "1"
-    hist = lru_cache(maxsize=4)(lambda tk, day: download_prices(list(tk), "4y"))
-    rec = lru_cache(maxsize=2)(lambda tk, bk: download_prices(list(tk), "7d", min_len=2))
-    meta_fn = lru_cache(maxsize=2)(load_meta_core)
-    inst_c = lru_cache(maxsize=2)(lambda codes, day: load_inst_history(list(codes), token=get_secret("FINMIND_TOKEN")))
-    news_c = lru_cache(maxsize=512)(lambda code, name, bk: load_news(f"{name} {code}"))
-    print("daemon 啟動；每 20 分鐘於 08:50~15:00（週一至週五）掃描一次。", flush=True)
-    while True:
-        now = now_tw()
-        if now.weekday() < 5 and dt.time(8, 50) <= now.time() <= dt.time(15, 0):
-            bk = now.strftime("%Y-%m-%d-%H-") + str(now.minute // 20)
-            try:
-                gp = lambda tk, bk=bk: merge_recent(hist(tuple(tk), bk[:10]), rec(tuple(tk), bk))
-                meta = meta_fn(bk.rsplit("-", 1)[0])
-                names, market = build_name_market(meta)
-                params = load_best_params() or Params()
-                eng, _, _ = build_engine_core(meta, n, ["金融保險業", "航運業", "水泥工業"], 35.0, 1.5, 8.0, 4.5, 10.0,
-                                              0.6, 0.10, rp / 100.0, use_intraday, gp,
-                                              inst_fn=lambda codes, bk=bk: inst_c(tuple(codes), bk[:10]))
-                nf = make_news_fn(names, lambda code, name, bk=bk: news_c(code, name, bk), float(os.environ.get("NEWS_WEIGHT", "1")))
-                ctx = assemble_ctx(meta, market, names, eng, params, gp, cap, rp, chip_w, load_portfolio(),
-                                   load_watchlist(), news_fn=nf)
-                msg, fresh = dispatch_alerts(build_alerts(eng, params, ctx), cfg)
-                print(f"[{now:%m-%d %H:%M}] 新訊號 {len(fresh)} 則：{msg}", flush=True)
-            except Exception as e:
-                print(f"[{now:%m-%d %H:%M}] 掃描失敗：{e}", flush=True)
-        now = now_tw()
-        time.sleep(max(30, 1200 - (now.minute % 20) * 60 - now.second))
+    mode = os.environ.get("USE_INTRADAY", "auto")
+    use_intraday = in_session(now) if mode == "auto" else mode == "1"
+    meta = meta_fn(now.strftime("%Y-%m-%d-%H"))
+    names, market = build_name_market(meta)
+    params = load_best_params() or Params()
+    eng, _, notes = build_engine_core(meta, n, SCAN_EXCL, 35.0, 1.5, 8.0, 6.0, 15.0, 0.6, 0.10, rp / 100.0,
+                                      use_intraday, get_prices_fn, inst_fn=inst_fn, keep_rows=340)
+    nf = make_news_fn(names, news_loader, float(os.environ.get("NEWS_WEIGHT", "1")))
+    ctx = assemble_ctx(meta, market, names, eng, params, get_prices_fn, cap, rp,
+                       float(os.environ.get("CHIP_WEIGHT", "1")), load_portfolio(), load_watchlist(), news_fn=nf)
+    alerts = build_alerts(eng, params, ctx)
+    msg, fresh = dispatch_alerts(alerts, cfg)
+    write_latest_scan(eng, params, ctx, names, notes)
+    print(f"[{now:%m-%d %H:%M}] 股票池 {len(eng.codes)} 檔｜資料日 {eng.idx[-1]:%Y-%m-%d}｜"
+          f"新訊號 {len(fresh)} 則｜{msg}｜記憶體 {rss_mb():.0f}MB", flush=True)
+    for m in notes:
+        print("  •", m, flush=True)
 
 
-if __name__ == "__main__" and "--daemon" in sys.argv:
-    daemon_main()
+def run_wf_cycle():
+    now = now_tw()
+    cfg = notify_cfg()
+    n = int(os.environ.get("N_BT", "300"))
+    meta = load_meta_core(now.strftime("%Y-%m-%d-%H"))
+    names, market = build_name_market(meta)
+    inst_fn = lambda codes: load_inst_history(list(codes), token=get_secret("FINMIND_TOKEN"), max_fetch=400)
+    eng, _, notes = build_engine_core(meta, n, SCAN_EXCL, 35.0, 1.5, 8.0, 6.0, 15.0, 0.6, 0.10,
+                                      float(os.environ.get("RISK_PCT", "1.5")) / 100.0, False,
+                                      lambda tk: download_prices(list(tk), "4y"), inst_fn=inst_fn)
+    wf = walk_forward(eng, train_days=250, test_days=80, obj_mode=os.environ.get("OBJ_MODE", "excess"))
+    if wf is None:
+        print("資料不足，無法 walk-forward", flush=True)
+        return
+    bq = eng.sleeve.reindex(wf["oos_equity"].index)
+    bret = (bq.iloc[-1] / bq.iloc[0] - 1) * 100 if len(bq) > 1 else np.nan
+    lv, hd, bl = verdict(wf, bret)
+    save_best_params(wf["final_params"], lv)
+    o = wf["oos_stats"]
+    summary = dict(updated=now.isoformat(timespec="minutes"), level=lv, headline=hd, bullets=bl, params=wf["final_params"].label(),
+                   oos_return=o["total_ret"], bench_return=bret, trades=o["n"], win_rate=o["win_rate"], mdd=o["mdd"])
+    try:
+        (STATE_DIR / "wf_summary.json").write_text(json.dumps(summary, ensure_ascii=False, default=float), encoding="utf-8")
+    except Exception:
+        pass
+    text = (f"🧪 Walk-Forward 週報 {now:%m/%d}\n{hd}\n策略 {o['total_ret']:+.1f}% vs 大盤 {bret:+.1f}%｜交易 {o['n']} 筆"
+            f"｜最大回撤 {o['mdd']:.1f}%\n本週採用參數：{wf['final_params'].label()}")
+    notify_routed("", text, cfg)
+    print(text, flush=True)
+
+
+def cli_main(flag: str):
+    os.environ["TQ_HEADLESS"] = "1"
+    inst_fn = lambda codes: load_inst_history(list(codes), token=get_secret("FINMIND_TOKEN"), max_fetch=400)
+    news = lambda code, name: load_news(f"{name} {code}")
+    if flag == "--wf-once":
+        run_wf_cycle()
+    elif flag == "--scan-once":
+        if not in_trading_window(now_tw()) and os.environ.get("FORCE") != "1":
+            print("非交易時段，略過（FORCE=1 可強制執行）。", flush=True)
+            return
+        run_scan_cycle(lambda tk: download_prices(list(tk), "2y", keep_rows=340), load_meta_core, inst_fn, news)
+    elif flag == "--daemon":
+        hist = lru_cache(maxsize=2)(lambda tk, day: download_prices(list(tk), "2y", keep_rows=340))
+        rec = lru_cache(maxsize=2)(lambda tk, bk: download_prices(list(tk), "7d", min_len=2))
+        meta_fn = lru_cache(maxsize=2)(load_meta_core)
+        news_c = lru_cache(maxsize=1024)(lambda code, name, day: load_news(f"{name} {code}"))
+        print("daemon 啟動；交易時段每 20 分鐘掃描一次。", flush=True)
+        while True:
+            now = now_tw()
+            if in_trading_window(now):
+                bk = now.strftime("%Y-%m-%d-%H-") + str(now.minute // 20)
+                try:
+                    run_scan_cycle(lambda tk, bk=bk: merge_recent(hist(tuple(tk), bk[:10]), rec(tuple(tk), bk)),
+                                   meta_fn, inst_fn, lambda code, name, d=bk[:10]: news_c(code, name, d))
+                except Exception as e:
+                    print(f"[{now:%m-%d %H:%M}] 掃描失敗：{e}", flush=True)
+                trim_memory()
+            now = now_tw()
+            time.sleep(max(30, 1200 - (now.minute % 20) * 60 - now.second))
+
+
+_CLI = [a for a in sys.argv[1:] if a in ("--scan-once", "--wf-once", "--daemon")]
+if __name__ == "__main__" and _CLI:
+    cli_main(_CLI[0])
     sys.exit(0)
 
 
 # ============================================================================
 # C. 介面
 # ============================================================================
+import plotly.graph_objects as go
+import streamlit as st
+
 st.set_page_config(page_title="台股量化操盤決策系統", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -1996,7 +2279,7 @@ sb.markdown("### 資金與風控")
 capital = sb.number_input("總操作資金 (TWD)", 50_000, 50_000_000, 1_000_000, 50_000)
 risk_pct = sb.slider("單筆最大承受風險 (%)", 0.5, 5.0, 1.5, 0.1)
 sb.markdown("### 股票池與過濾")
-n_universe = sb.select_slider("分析股票池（當日成交值前 N 檔）", [100, 150, 200, 250, 300, 400], value=200)
+n_universe = sb.select_slider("網站內分析股票池（當日成交值前 N 檔；更大的池請用「排程全市場掃描」）", [100, 150, 200, 300, 400, 500, 600], value=300)
 excl = sb.multiselect("排除產業", ["金融保險業", "航運業", "水泥工業", "食品工業", "貿易百貨業", "觀光餐旅", "塑膠工業", "造紙工業"],
                       default=["金融保險業", "航運業", "水泥工業"])
 min_price = sb.number_input("最低股價", 1.0, 500.0, 35.0, 1.0)
@@ -2026,27 +2309,40 @@ if sb.button("🔄 重新抓取最新資料"):
     st.rerun()
 
 # ============================================================================
-# 資料載入（快取）＋ 每 20 分鐘自動更新
+# 記憶體保護、資料載入（快取有上限）＋ 交易時段每 20 分鐘自動更新
 # ============================================================================
-REFRESH_TICK_SEC = 300      # 每 5 分鐘檢查一次是否進入新的 20 分鐘時段
+REFRESH_TICK_SEC = 300      # 每 5 分鐘檢查一次是否進入新的更新時段
+MEM_LIMIT_MB = 850          # 超過就自動釋放快取（Streamlit 免費方案上限約 1GB）
+
+_rss = rss_mb()
+if _rss > MEM_LIMIT_MB:
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    trim_memory()
+    st.toast(f"記憶體 {_rss:,.0f} MB 偏高，已自動釋放快取並重新載入。")
+    _rss = rss_mb()
+sb.caption(f"🧠 記憶體 {_rss:,.0f} MB（上限約 1,000 MB，超過 {MEM_LIMIT_MB} MB 會自動清快取）")
 
 
 def bucket_key() -> str:
+    """交易時段：每 20 分鐘一個時段（盤中更新）；收盤後/假日：每天一個（只建一次，記憶體不再成長）。"""
     n = now_tw()
-    return n.strftime("%Y-%m-%d-%H-") + str(n.minute // 20)
+    if in_session(n):
+        return n.strftime("%Y-%m-%d-%H-") + str(n.minute // 20)
+    return n.strftime("%Y-%m-%d-F")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, max_entries=2, show_spinner=False)
 def load_meta(hour_key: str):
     return load_meta_core(hour_key)
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
+@st.cache_data(ttl=6 * 3600, max_entries=2, show_spinner=False)
 def prices_hist(tickers: tuple, day_key: str):
     return download_prices(list(tickers), period="4y")
 
 
-@st.cache_data(ttl=1200, show_spinner=False)
+@st.cache_data(ttl=1200, max_entries=2, show_spinner=False)
 def prices_recent(tickers: tuple, bucket: str):
     return download_prices(list(tickers), period="7d", min_len=2)
 
@@ -2056,27 +2352,34 @@ def get_prices(tickers, bucket: str) -> dict:
     return merge_recent(prices_hist(tk, bucket[:10]), prices_recent(tk, bucket))
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
+@st.cache_data(ttl=6 * 3600, max_entries=2, show_spinner=False)
 def inst_cached(codes: tuple, day_key: str):
-    return load_inst_history(list(codes), token=get_secret("FINMIND_TOKEN"))
+    return load_inst_history(list(codes), token=get_secret("FINMIND_TOKEN"), max_fetch=400)
 
 
-@st.cache_data(ttl=1200, show_spinner=False)
-def news_cached(code: str, name: str, bucket: str):
+@st.cache_data(ttl=1200, max_entries=400, show_spinner=False)
+def news_cached(code: str, name: str, day_key: str):
     return load_news(f"{name} {code}")
 
 
-@st.cache_resource(ttl=1500, show_spinner=False)
+@st.cache_data(ttl=600, max_entries=4, show_spinner=False)
+def remote_state(name: str):
+    return fetch_state_json(name)
+
+
+@st.cache_resource(ttl=3 * 3600, max_entries=1, show_spinner=False)
 def build_engine(bucket, n, excl_t, min_price, min_turn_yi, min_amp, b5, b20, fee_disc, slip_pct, risk_pct, use_intraday):
     meta_ = load_meta(bucket.rsplit("-", 1)[0])
-    return build_engine_core(meta_, n, list(excl_t), min_price, min_turn_yi, min_amp, b5, b20, fee_disc, slip_pct,
-                             risk_pct / 100.0, use_intraday, lambda tk: get_prices(tk, bucket),
-                             inst_fn=lambda codes: inst_cached(tuple(codes), bucket[:10]))
+    out = build_engine_core(meta_, n, list(excl_t), min_price, min_turn_yi, min_amp, b5, b20, fee_disc, slip_pct,
+                            risk_pct / 100.0, use_intraday, lambda tk: get_prices(tk, bucket),
+                            inst_fn=lambda codes: inst_cached(tuple(codes), bucket[:10]))
+    trim_memory()
+    return out
 
 
 bucket = bucket_key()
 try:
-    with st.spinner("更新資料中（首次約 30~90 秒；之後每 20 分鐘自動增量更新）…"):
+    with st.spinner("更新資料中（首次約 1~3 分鐘；之後交易時段每 20 分鐘自動增量更新，收盤後每天只更新一次）…"):
         eng, bench_df, eng_notes = build_engine(bucket, n_universe, tuple(excl), min_price, min_turn_yi, min_amp,
                                                 bias5_max, bias20_max, fee_disc, slip_pct, risk_pct, use_intraday)
         meta = load_meta(bucket.rsplit("-", 1)[0])
@@ -2095,7 +2398,7 @@ chip_fn = make_chip_fn(meta["chips"], chip_weight)
 news_fn = make_news_fn(NAMES, lambda code, name: news_cached(code, name, bucket), news_weight)
 
 wf = st.session_state.get("wf")
-params = st.session_state.get("final_params") or load_best_params() or Params()
+params = st.session_state.get("final_params") or load_best_params(fetch=remote_state) or Params()
 portfolio_rows = st.session_state.setdefault("portfolio", load_portfolio())
 watch_codes = st.session_state.setdefault("watchlist", load_watchlist())
 
@@ -2106,12 +2409,11 @@ def label(code: str) -> str:
 
 
 def chip_dict(code: str):
-    out = {}
     ch = meta["chips"]
     if code in ch.index:
         r = ch.loc[code]
-        out.update(foreign=float(r["foreign"]), trust=float(r["trust"]), total=float(r["total"]))
-    return out or None
+        return dict(foreign=float(r["foreign"]), trust=float(r["trust"]), total=float(r["total"]))
+    return None
 
 
 def link_html(code: str) -> str:
@@ -2121,21 +2423,23 @@ def link_html(code: str) -> str:
 
 def cur_cfg() -> dict:
     base, ov = notify_cfg(), st.session_state.get("cfg_override", {})
-    return {k: (ov.get(k) or base.get(k, "")) for k in ("tg_token", "tg_chat", "line_token", "line_user")}
+    out = {k: (ov.get(k) or base.get(k, "")) for k in ("tg_token", "tg_chat", "line_token", "line_user")}
+    out["line_broadcast"] = ov["line_broadcast"] if "line_broadcast" in ov else base["line_broadcast"]
+    return out
 
 
-with st.expander("📡 資料狀態（來源、日期、抓取失敗訊息）"):
-    st.write(f"價格資料最新日期：**{data_date}**　｜　股票池：**{len(eng.codes)}** 檔　｜　系統時間：{now_tw():%Y-%m-%d %H:%M} (台北)")
+with st.expander("📡 資料狀態（來源、日期、資料品質、抓取失敗訊息）"):
+    st.write(f"價格資料最新日期：**{data_date}**　｜　股票池：**{len(eng.codes)}** 檔　｜　系統時間：{now_tw():%Y-%m-%d %H:%M} (台北)　｜　記憶體 {rss_mb():,.0f} MB")
     for m in eng_notes + meta["msgs"]:
         st.caption("• " + m)
-    st.caption("• 即時籌碼（三大法人近5日）只接上市；「主力」因子的歷史逐日資料來自 FinMind（上市櫃皆有，會進入回測）。新聞與營收沒有歷史資料，不在回測內，只作輔助。")
+    st.caption("• 即時籌碼（三大法人近5日）只接上市；『主力』因子的歷史逐日資料來自 FinMind（上市櫃皆有，會進入回測）。新聞與營收沒有歷史資料，不在回測內，只作輔助。")
 
 
 @st.fragment(run_every=REFRESH_TICK_SEC)
 def auto_tick():
     cur, loaded = bucket_key(), st.session_state.get("loaded_bucket")
     mode = "盤中・含未收盤K線" if use_intraday else "僅用已收盤K線"
-    st.caption(f"⏱ 每 20 分鐘自動更新（不需按重新整理）｜資料時段 {loaded}｜台北時間 {now_tw():%H:%M:%S}｜{mode}")
+    st.caption(f"⏱ 交易時段每 20 分鐘自動更新（不需按重新整理）｜資料時段 {loaded}｜台北時間 {now_tw():%H:%M:%S}｜{mode}")
     if loaded != cur:
         st.rerun()
 
@@ -2148,16 +2452,17 @@ alerts = build_alerts(eng, params, ctx)
 
 cfg_now = cur_cfg()
 configured = bool((cfg_now["tg_token"] and cfg_now["tg_chat"]) or cfg_now["line_token"])
-if st.session_state.get("auto_push", configured) and st.session_state.get("alerted_bucket") != bucket:
-    msg, fresh = dispatch_alerts(alerts, cfg_now, st.session_state.get("alert_cats", list(ALERT_CATS)))
+if st.session_state.get("_auto_push", configured) and st.session_state.get("alerted_bucket") != bucket:
+    msg, fresh = dispatch_alerts(alerts, cfg_now, st.session_state.get("_alert_cats", list(ALERT_CATS)))
     st.session_state["alerted_bucket"] = bucket
     st.session_state.setdefault("alert_log", []).insert(0, f"{now_tw():%m-%d %H:%M} ｜ 新訊號 {len(fresh)} 則 ｜ {msg}")
+    st.session_state["alert_log"] = st.session_state["alert_log"][:30]
     if fresh:
         st.toast(f"已推送 {len(fresh)} 則新訊號")
 
-tab_daily, tab_port, tab_sec, tab_val, tab_scr, tab_alert = st.tabs([
-    "🎯 每日決策與推薦", "💼 持股健檢與換股", "🌐 族群多空儀表板", "🧪 Walk-Forward 驗證與風險",
-    "🛠️ 15 項全景篩選器", "🔔 推播與自選股監控"])
+PAGES = ["🎯 每日決策與推薦", "💼 持股健檢與換股", "🌐 族群多空儀表板", "🧪 Walk-Forward 驗證與風險",
+         "🛠️ 15 項全景篩選器", "🔭 排程全市場掃描", "🔔 推播與自選股監控"]
+page = st.radio("頁面", PAGES, horizontal=True, label_visibility="collapsed", key="page")   # 一次只執行一頁，省記憶體與運算
 
 
 def candle_fig(df: pd.DataFrame, n: int, stop=None, tp=None, height=380, title=""):
@@ -2202,7 +2507,7 @@ def chip_line(code: str, det: dict) -> str:
     return "　｜　".join(parts)
 
 
-with tab_daily:
+if page == PAGES[0]:
     st.markdown(f"### 盤勢與做多決策 ｜ 資料日期 {data_date}")
     breadth = float(eng.breadth.iloc[-1]) * 100
     (st.info if regime_ok else st.warning)(
@@ -2223,10 +2528,7 @@ with tab_daily:
     if not cands:
         st.warning("今日沒有標的同時通過流動性、趨勢、乖離與分數門檻。空手也是一種部位。")
     else:
-        calib_key = f"calib_{params.preset}_{params.hold}_{data_date}"
-        if calib_key not in st.session_state:
-            st.session_state[calib_key] = score_calibration(eng, params.preset, params.hold)
-        calib = st.session_state[calib_key]
+        calib = eng_memo(eng, ("calib", params.preset, params.hold), lambda: score_calibration(eng, params.preset, params.hold))
 
         t1 = cands[0]
         code = t1["code"]
@@ -2306,7 +2608,7 @@ with tab_daily:
 # ============================================================================
 # Tab 2：持股
 # ============================================================================
-with tab_port:
+if page == PAGES[1]:
     st.markdown("### 💼 持股健檢與換股（存於 portfolio.json）")
     base = pd.DataFrame(portfolio_rows) if portfolio_rows else pd.DataFrame(columns=["code", "cost", "shares", "date"])
     for col in ("code", "cost", "shares", "date"):
@@ -2391,10 +2693,10 @@ with tab_port:
 # ============================================================================
 # Tab 3：族群
 # ============================================================================
-with tab_sec:
+if page == PAGES[2]:
     st.markdown("### 🌐 族群多空儀表板（真實價量 + 官方籌碼/營收；沒資料就不顯示）")
     st.markdown("##### 📊 族群強弱排行（依產業別，股票池真實價量統計；越上面越強）")
-    stab = sector_table(eng, NAMES)
+    stab = eng_memo(eng, "sector_table", lambda: sector_table(eng, NAMES))
     if len(stab):
         st.dataframe(stab, use_container_width=True, hide_index=True)
         st.caption("強度＝20日報酬、60日報酬、站上月線比例的綜合排名；此排名也已納入評分的『族群強度』特徵（可回測）。")
@@ -2446,7 +2748,7 @@ with tab_sec:
 # ============================================================================
 # Tab 4：驗證
 # ============================================================================
-with tab_val:
+if page == PAGES[3]:
     st.markdown("### 🧪 Walk-Forward 驗證與風險")
     st.caption("做法：滾動視窗——用訓練期挑參數（分數權重預設、進場門檻、ATR停損倍數、停利R、持股天數），"
                "再拿『沒看過的』測試期驗證，最後把所有測試期串起來看樣本外績效。回測含手續費、證交稅、滑價；"
@@ -2537,7 +2839,7 @@ with tab_val:
 
         st.markdown("##### 🔬 訊號預測力檢驗（整個股票池、不限於實際下單的標的）")
         hz = st.select_slider("預測期間（交易日）", [5, 10, 15, 20], value=10)
-        sq = signal_quality(eng, params.preset, hz)
+        sq = eng_memo(eng, ("sq", params.preset, hz), lambda: signal_quality(eng, params.preset, hz))
         q1, q2, q3 = st.columns(3)
         q1.metric("Rank IC 平均", f(sq["ic_mean"], "{:+.3f}"), "分數 vs 未來報酬的排序相關")
         q2.metric("IC t 值", f(sq["ic_t"]), "|t|>2 才算顯著")
@@ -2566,9 +2868,9 @@ with tab_val:
 # ============================================================================
 # Tab 5：篩選器
 # ============================================================================
-with tab_scr:
+if page == PAGES[4]:
     st.markdown("### 🛠️ 15 項全景篩選器（對整個流動性股票池，不受推薦過濾影響）")
-    snap = snapshot(eng, params.preset)
+    snap = eng_memo(eng, ("snap", params.preset), lambda: snapshot(eng, params.preset))
     snap = snap[snap["liquid"]]
     chosen = []
     with st.expander("勾選條件（全部 AND）", expanded=True):
@@ -2595,9 +2897,37 @@ with tab_scr:
         st.caption(f"符合 {len(res)} 檔 / 流動性股票池 {len(snap)} 檔。")
 
 # ============================================================================
+# 排程全市場掃描（由 GitHub Actions 計算；本頁只讀結果，不佔網站記憶體）
+# ============================================================================
+@st.cache_data(ttl=300, max_entries=1, show_spinner=False)
+def load_latest_scan():
+    return fetch_state_json("latest_scan.json")
+
+
+if page == PAGES[5]:
+    st.markdown("### 🔭 排程全市場掃描（更大的股票池，盤中每 20 分鐘由 GitHub Actions 計算並推播）")
+    scan = load_latest_scan()
+    if not scan:
+        st.info("尚未取得掃描結果。請依說明設定 GitHub Actions 排程，並在 Streamlit Secrets 設定 STATE_BASE_URL"
+                "（指向 state 分支的 raw 網址）。這個頁面只讀取結果，所以不會增加網站記憶體。")
+    else:
+        lvl_ = int(scan.get("regime", 1))
+        (st.info if lvl_ else st.warning)(f"掃描時間 {scan['updated']}｜資料日 {scan['data_date']}｜股票池 {scan['universe']} 檔｜"
+                                          f"通過條件 {scan['eligible']} 檔｜大盤環境 {LVL_TXT[lvl_]}")
+        st.caption("使用參數：" + scan.get("params", ""))
+        if scan.get("candidates"):
+            df_s = pd.DataFrame(scan["candidates"]).rename(columns={
+                "code": "代碼", "name": "名稱", "group": "族群", "final": "最終分", "tech": "技術分", "main": "主力加減",
+                "close": "收盤", "pct": "漲跌%", "stop": "停損", "tp": "停利", "risk": "風險%", "turnover": "5日均額(億)"})
+            st.dataframe(df_s, use_container_width=True, hide_index=True)
+        else:
+            st.warning("本次掃描沒有標的通過條件。")
+        for m_ in scan.get("notes", []):
+            st.caption("• " + m_)
+# ============================================================================
 # Tab 6：推播與自選股監控
 # ============================================================================
-with tab_alert:
+if page == PAGES[6]:
     st.markdown("### 🔔 推播與自選股監控（Telegram / LINE）")
     st.caption("頁面開著時每 20 分鐘自動掃描；要『瀏覽器關閉也推播』請在主機另外執行 `python tw_quant_app.py --daemon`。"
                "同一則訊號不會重複推送（記錄在 alert_state.json）。")
@@ -2613,12 +2943,19 @@ with tab_alert:
         ov["tg_token"] = st.text_input("Telegram Bot Token（僅存於本次連線）", value=ov.get("tg_token", ""), type="password")
         ov["tg_chat"] = st.text_input("Telegram Chat ID", value=ov.get("tg_chat", ""))
         ov["line_token"] = st.text_input("LINE Channel access token", value=ov.get("line_token", ""), type="password")
-        ov["line_user"] = st.text_input("LINE User ID（可留空=廣播）", value=ov.get("line_user", ""))
+        ov["line_user"] = st.text_input("LINE User ID（你自己的；持股警示只會傳給這個 ID）", value=ov.get("line_user", ""))
+        ov["line_broadcast"] = st.checkbox("LINE 廣播公開訊號給所有加好友的人（持股警示仍只傳給你）",
+                                           value=bool(ov.get("line_broadcast", notify_cfg()["line_broadcast"])))
+        st.caption("廣播只會送到『已加入該官方帳號為好友』的人；好友人數可在 LINE Official Account Manager 查看。"
+                   "也可用環境變數/Secrets 設定 LINE_BROADCAST=1。")
     cfg_now = cur_cfg()
     configured = bool((cfg_now["tg_token"] and cfg_now["tg_chat"]) or cfg_now["line_token"])
     a1, a2 = st.columns(2)
-    a1.checkbox("開啟自動推播（每 20 分鐘掃描一次）", value=configured, key="auto_push")
-    a2.multiselect("推播哪些類型", list(ALERT_CATS), default=list(ALERT_CATS), format_func=lambda k: ALERT_CATS[k], key="alert_cats")
+    st.session_state["_auto_push"] = a1.checkbox("開啟自動推播（交易時段每 20 分鐘掃描一次）",
+                                                 value=st.session_state.get("_auto_push", configured))
+    st.session_state["_alert_cats"] = a2.multiselect("推播哪些類型", list(ALERT_CATS),
+                                                     default=st.session_state.get("_alert_cats", list(ALERT_CATS)),
+                                                     format_func=lambda k: ALERT_CATS[k])
     if st.button("📨 傳送測試訊息"):
         res = notify_all("✅ 台股量化系統推播測試成功。", cfg_now) if configured else []
         if not res:
