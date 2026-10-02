@@ -1,0 +1,71 @@
+# 每週六自動跑一次 Walk-Forward，更新「本週採用的參數」並推播週報。
+name: walkforward
+
+on:
+  schedule:
+    - cron: "0 2 * * 6"              # UTC 週六 02:00 = 台北週六 10:00
+  workflow_dispatch:
+
+concurrency:
+  group: tq-state
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  wf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-scan.txt
+      - run: pip install -r requirements-scan.txt
+
+      - name: 取出 state 分支
+        run: |
+          if git ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
+            git clone --depth 1 --branch state "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
+            rm -rf state/.git
+          else
+            mkdir state
+          fi
+
+      - name: 還原主力資料快取
+        id: day
+        run: echo "d=$(TZ=Asia/Taipei date +%F)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            state/inst_history.csv
+            state/inst_refresh.txt
+          key: inst-${{ steps.day.outputs.d }}
+          restore-keys: inst-
+
+      - name: Walk-Forward
+        env:
+          STATE_DIR: state
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          N_BT: ${{ vars.N_BT || '300' }}
+          OBJ_MODE: ${{ vars.OBJ_MODE || 'excess' }}
+          RISK_PCT: ${{ vars.RISK_PCT || '1.5' }}
+        run: python tw_quant_app.py --wf-once
+
+      - name: 存回 state 分支
+        run: |
+          cd state
+          printf 'inst_history.csv\ninst_refresh.txt\n' > .gitignore
+          git init -q -b state
+          git config user.name "tq-bot"
+          git config user.email "tq-bot@users.noreply.github.com"
+          git add -A
+          git commit -q -m "state $(date -u +%FT%TZ)"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
