@@ -1,0 +1,13 @@
+{
+  "preset": "主力籌碼型",
+  "min_score": 70,
+  "stop_atr": 3.5,
+  "tp_r": 0.0,
+  "hold": 20,
+  "trail_atr": 3.0,
+  "heat": "中",
+  "active": 0.5,
+  "bear_cash": false,
+  "verdict": "red",
+  "saved": "2026-10-03T10:21:20.420997+08:00"
+}
