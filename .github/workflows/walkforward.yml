@@ -22,9 +22,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-scan.txt
-      - run: pip install -r requirements-scan.txt
+      - name: 安裝套件
+        run: pip install yfinance pandas numpy requests lxml html5lib beautifulsoup4 tzdata
+
+      - name: 找出程式檔（檔名不是 tw_quant_app.py 也能跑）
+        id: code
+        run: |
+          ls -la
+          F=$(find . -maxdepth 3 -name '*.py' -not -path './state/*' -print0 | xargs -0 grep -l -- "--wf-once" 2>/dev/null | head -1)
+          if [ -z "$F" ]; then echo "::error::repo 裡找不到含 --wf-once 的 .py 檔，請上傳最新版 tw_quant_app.py 到根目錄"; exit 1; fi
+          echo "file=$F" >> "$GITHUB_OUTPUT"
 
       - name: 取出 state 分支
         run: |
@@ -57,7 +64,7 @@ jobs:
           N_BT: ${{ vars.N_BT || '300' }}
           OBJ_MODE: ${{ vars.OBJ_MODE || 'excess' }}
           RISK_PCT: ${{ vars.RISK_PCT || '1.5' }}
-        run: python tw_quant_app.py --wf-once
+        run: python "${{ steps.code.outputs.file }}" --wf-once
 
       - name: 存回 state 分支
         run: |
