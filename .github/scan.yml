@@ -1,0 +1,87 @@
+# 盤中每 20 分鐘掃描「全市場大股票池」→ 符合策略的標的推播到 Telegram / LINE
+# 計算在 GitHub 的機器上跑（記憶體 7GB），Streamlit 網站只讀結果，所以不會再爆記憶體。
+name: scan
+
+on:
+  schedule:
+    - cron: "*/20 0-6 * * 1-5"      # UTC 00:00–06:59 = 台北 08:00–14:59，週一到週五
+  workflow_dispatch:                 # 也可以在 Actions 頁面手動執行
+
+concurrency:
+  group: tq-state                    # 掃描與週報共用，避免同時寫 state 分支
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安裝套件
+        run: pip install yfinance pandas numpy requests lxml html5lib beautifulsoup4 tzdata
+
+      - name: 找出程式檔（檔名不是 tw_quant_app.py 也能跑）
+        id: code
+        run: |
+          ls -la
+          F=$(find . -maxdepth 3 -name '*.py' -not -path './state/*' -print0 | xargs -0 grep -l -- "--scan-once" 2>/dev/null | head -1)
+          if [ -z "$F" ]; then echo "::error::repo 裡找不到含 --scan-once 的 .py 檔，請上傳最新版 tw_quant_app.py 到根目錄"; exit 1; fi
+          echo "file=$F" >> "$GITHUB_OUTPUT"
+
+      - name: 取出 state 分支（不存在就建立空資料夾）
+        run: |
+          if git ls-remote --exit-code --heads origin state >/dev/null 2>&1; then
+            git clone --depth 1 --branch state "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
+            rm -rf state/.git
+          else
+            mkdir state
+          fi
+
+      - name: 還原主力資料快取（檔案很大，不放進 git）
+        id: day
+        run: echo "d=$(TZ=Asia/Taipei date +%F)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            state/inst_history.csv
+            state/inst_refresh.txt
+          key: inst-${{ steps.day.outputs.d }}
+          restore-keys: inst-
+
+      - name: 掃描並推播
+        env:
+          STATE_DIR: state
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          LINE_BROADCAST: ${{ vars.LINE_BROADCAST }}       # 設 1 = 公開訊號廣播給所有好友
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          PORTFOLIO_JSON: ${{ secrets.PORTFOLIO_JSON }}     # 你的持股（只存在 Secrets，不進 repo）
+          WATCHLIST: ${{ vars.WATCHLIST }}                  # 例：2330,2454,3037
+          N_UNIVERSE: ${{ vars.N_UNIVERSE || '1200' }}
+          SHORTLIST_N: ${{ vars.SHORTLIST_N || '200' }}        # 第一階段挑出幾檔強勢股給網站分析
+          EXTRA_CODES: ${{ vars.EXTRA_CODES }}                  # 你在其他網站選的代碼，例：2330,2454,3037
+          SHORTLIST_URLS: ${{ vars.SHORTLIST_URLS }}            # 選填：會輸出股票代碼的網址（CSV／試算表／靜態頁），多個用空白分隔
+          CAPITAL: ${{ vars.CAPITAL || '1000000' }}
+          RISK_PCT: ${{ vars.RISK_PCT || '1.5' }}
+        run: python "${{ steps.code.outputs.file }}" --scan-once
+
+      - name: 存回 state 分支（永遠只保留 1 個 commit，repo 不會變肥）
+        run: |
+          cd state
+          printf 'inst_history.csv\ninst_refresh.txt\n' > .gitignore
+          git init -q -b state
+          git config user.name "tq-bot"
+          git config user.email "tq-bot@users.noreply.github.com"
+          git add -A
+          git commit -q -m "state $(date -u +%FT%TZ)"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
