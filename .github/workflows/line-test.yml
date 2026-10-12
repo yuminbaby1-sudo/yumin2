@@ -1,0 +1,53 @@
+# LINE 推播測試：不跑掃描，只檢查金鑰有沒有讀到，並直接送一則測試訊息，把 LINE 的回覆印在日誌裡。
+name: line-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      broadcast:
+        description: "同時測試廣播給所有好友（會打擾所有人，平常不要勾）"
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 1. 檢查金鑰有沒有讀到（只顯示長度，不顯示內容）
+        env:
+          T: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          U: ${{ secrets.LINE_USER_ID }}
+        run: |
+          export LC_ALL=C
+          echo "LINE_CHANNEL_TOKEN 長度：${#T}（0 = 沒設定到；正常約 170 以上）"
+          echo "LINE_USER_ID 長度：${#U}（正常是 33，且以 U 開頭）"
+          echo "LINE_USER_ID 第一個字元：${U:0:1}"
+          case "$T" in *[![:print:]]*) echo "⚠ TOKEN 含有不是一般英數的字元（可能把全形「；」或換行一起貼進去了）" ;; esac
+          case "$U" in *[![:print:]]*) echo "⚠ USER_ID 含有不是一般英數的字元（可能把全形「；」或換行一起貼進去了）" ;; esac
+          case "$T" in *" "*) echo "⚠ TOKEN 含有空白" ;; esac
+          case "$U" in *" "*) echo "⚠ USER_ID 含有空白" ;; esac
+
+      - name: 2. 推播一則測試訊息給你自己
+        env:
+          T: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          U: ${{ secrets.LINE_USER_ID }}
+        run: |
+          curl -sS -o resp.txt -w "HTTP 狀態碼：%{http_code}\n" -X POST https://api.line.me/v2/bot/message/push \
+            -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
+            -d "{\"to\":\"$U\",\"messages\":[{\"type\":\"text\",\"text\":\"✅ GitHub 推播測試成功（只傳給你）\"}]}"
+          echo "LINE 回覆內容："
+          cat resp.txt
+          echo
+
+      - name: 3. 廣播測試（只有勾選時才執行）
+        if: ${{ inputs.broadcast }}
+        env:
+          T: ${{ secrets.LINE_CHANNEL_TOKEN }}
+        run: |
+          curl -sS -o resp2.txt -w "HTTP 狀態碼：%{http_code}\n" -X POST https://api.line.me/v2/bot/message/broadcast \
+            -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
+            -d "{\"messages\":[{\"type\":\"text\",\"text\":\"✅ 廣播測試成功（所有好友都會收到）\"}]}"
+          echo "LINE 回覆內容："
+          cat resp2.txt
+          echo
