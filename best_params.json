@@ -1,0 +1,15 @@
+{
+  "preset": "均衡",
+  "min_score": 65.0,
+  "stop_mode": "structure",
+  "stop_atr": 2.0,
+  "tp_r": 0.0,
+  "hold": 30,
+  "trail_atr": 4.5,
+  "heat": "中",
+  "active": 0.0,
+  "bear_cash": false,
+  "partial": 0.0,
+  "verdict": "yellow",
+  "saved": "2026-10-24T10:31:25.446456+08:00"
+}
