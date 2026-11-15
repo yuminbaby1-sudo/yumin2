@@ -850,11 +850,14 @@ PRESETS = {
     "均衡":       {"trend": .14, "compress": .08, "mom": .10, "rs": .20, "main": .20, "setup": .08, "nh": .10, "sector": .10},
     "主力籌碼型": {"trend": .10, "compress": .05, "mom": .08, "rs": .15, "main": .35, "setup": .07, "nh": .08, "sector": .12},
     "強勢領漲型": {"trend": .10, "compress": .05, "mom": .10, "rs": .30, "main": .10, "setup": .05, "nh": .20, "sector": .10},
+    "反彈型":     {"trend": .05, "compress": .05, "mom": .08, "rs": .12, "main": .15, "setup": .05, "nh": .05, "sector": .10,
+                   "resil": .15, "rebound": .20},        # 深跌反彈：抗跌領頭 + 超跌反轉/換手 佔 35%
 }
 # 參數網格刻意縮小（96+2 組）：自由度越少，越不容易「在歷史上剛好幸運」＝過擬合越少。
 # 停損3ATR、追蹤4.5ATR、持股30日等已是合理先驗，固定不調。
 LEARNED = "學習型"          # 權重不是人為設定，而是用訓練期資料學出來的（嶺迴歸），並只在『沒看過的』測試期驗證
-FEAT_NAMES = ("trend", "compress", "mom", "rs", "nh", "sector", "main", "setup")
+FEAT_NAMES = ("trend", "compress", "mom", "rs", "nh", "sector", "main", "setup", "resil", "rebound")
+REBOUND = "反彈型"        # 深跌反彈 / 換手成功專用：可在大盤空頭的『止跌』時小部位進場（見 simulate）
 DEFAULT_GRID = dict(
     preset=list(PRESETS) + [LEARNED],
     min_score=[65],
@@ -868,7 +871,6 @@ DEFAULT_GRID = dict(
     bear_cash=[False, True],
     partial=[0.0, 0.5],
 )
-
 
 # ----------------------------------------------------------------------------
 # 指標（單一標的）
@@ -960,6 +962,72 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
                   & ((upper > 0.5) | ((c < o) & (body_dn > 0.6)))).astype(float)   # 漲幅>25%後爆量長上影/長黑
     # 隔日沖風險（沒有券商分點資料時的代理）：單日大漲≥7% 且爆量≥2.5 倍 → 隔天常見開高倒貨
     d["Surge"] = ((d["pct"] >= 7) & (v > 2.5 * d["Vol_MA20"].shift(1))).astype(float)
+    # ---- 深跌反彈 / 換手成功 訊號：錘子線、吞噬紅K、底部背離、窒息量後爆量 ----
+    body, lower, rng = (c - o).abs(), np.minimum(o, c) - l, h - l
+    d["Hammer"] = ((rng > 0) & (lower >= 2 * np.maximum(body, 0.1 * rng)) & (lower / (rng + 1e-9) >= 0.5)
+                   & (d["Close_loc"] >= 0.55)).astype(float)                               # 下影線 ≥2 倍實體且收在上半部
+    po, pcl = o.shift(1), c.shift(1)
+    d["Engulf"] = ((pcl < po) & (c > o) & (c >= po) & (o <= pcl)).astype(float)               # 吞噬紅K
+    d["High3_prev"] = h.shift(1).rolling(3).max()
+    is_lo = l <= l.rolling(20, min_periods=10).min()
+    rsi_prev_lo = d["RSI"].where(is_lo).shift(5).ffill()
+    d["BullDiv"] = ((l <= d["Low20_prev"] * 1.01) & (d["RSI"] > rsi_prev_lo + 3) & (d["RSI"] < 45)).astype(float)  # 價創低、RSI 墊高
+    d["DryCnt5"] = (v <= 0.6 * d["Vol_MA20"]).astype(float).shift(1).rolling(5).sum()           # 前 5 日窒息量天數
+    d["Dd60"] = c / c.rolling(60, min_periods=20).max() - 1                                      # 距 60 日高點的回落
+    # ---- 深跌反彈進階指標（聯發科型態拆解）----
+    # (A) 爆量長黑後止跌（Capitulation → Confirmation）：
+    #     當日跌幅大、量 ≥ 20日均量2倍、收黑；隔天不破前低或收紅 = 換手成功
+    big_black = ((c < o) & (body / (rng + 1e-9) > 0.5) & (v >= 2 * d["Vol_MA20"].shift(1))
+                 & (d["pct"] <= -3)).astype(float)
+    d["CapitBlack"] = big_black                                                                    # 恐慌爆量長黑
+    capit_prev = big_black.shift(1).fillna(0)
+    d["CapitConfirm"] = (capit_prev & (l >= l.shift(1)) & (c > o)).astype(float)                  # 隔日不破低且收紅 = 確認換手
+    d["CapitVol"] = big_black.shift(1).fillna(0) * (v.shift(1) / (d["Vol_MA20"].shift(2) + 1e-9)) # 爆量倍數（回測用）
+
+    # (B) 島狀反轉 / 晨星變形：向下跳空缺口 + 止跌紅K + 後續收復缺口
+    gap_dn = (h < l.shift(1)).astype(float)                                                        # 向下跳空缺口
+    gap_dn_hi = l.shift(1).where(gap_dn > 0)                                                      # 缺口上緣
+    gap_dn_hi_ff = gap_dn_hi.ffill()
+    d["GapDn"] = gap_dn
+    d["IslandRev"] = ((gap_dn.shift(1).rolling(5).max() > 0) & (c > gap_dn_hi_ff) &               # 5日內有向下缺口，且收盤收復
+                      (c > o) & (v > d["Vol_MA5"].shift(1) * 1.2)).astype(float)                   # 放量紅K封閉缺口
+
+    # (C) 均線乖離修正 + 短均線翻揚（安全的右側進場點）
+    ma5_slope = d["MA5"] - d["MA5"].shift(3)
+    d["MA5_TurnUp"] = ((d["MA5"].shift(3) > d["MA5"].shift(5))                                    # MA5 曾下彎
+                       & (ma5_slope > 0) & (c > d["MA5"])).astype(float)                           # 現在翻揚且站上
+    bias60 = (c / d["MA60"] - 1) * 100
+    d["Bias60"] = bias60
+    d["ExtrBias20"] = (d["Bias20"] < -15).astype(float)                                            # 月線負乖離極端 (< -15%)
+    d["ExtrBias60"] = (bias60 < -20).astype(float)                                                 # 季線負乖離極端 (< -20%)
+
+    # (D) 套牢區消化力（碰到下彎長均線或前波高點時的行為）
+    ma60_dn = (d["MA60"] < d["MA60"].shift(5))                                                    # 季線下彎
+    at_resist = ((h >= d["MA60"] * 0.99) & ma60_dn) | (h >= d["High60_prev"] * 0.99)             # 碰到壓力
+    # 碰壓力但沒被壓回（沒有爆量長黑），且溫和放量 = 消化賣壓
+    d["ResistAbsorb"] = (at_resist & (c >= o) & (v >= d["Vol_MA5"].shift(1) * 0.8)
+                         & ~(big_black > 0)).astype(float)
+
+    # (E) 底部 KD 黃金交叉（50 附近多空分界，非超賣鈍化區）
+    d["KD_MidGold"] = ((d["K"] > d["D"]) & (d["K"].shift(1) <= d["D"].shift(1))
+                       & (d["K"] >= 35) & (d["K"] <= 65)).astype(float)                            # KD 在 35~65 黃金交叉
+
+    # (F) RSI / MACD 底部背離強化版（股價破底但指標墊高）
+    is_lo_ext = l <= l.rolling(30, min_periods=10).min()
+    rsi_prev_lo_ext = d["RSI"].where(is_lo_ext).shift(5).ffill()
+    macd_prev_lo = d["MACD_Hist"].where(is_lo_ext).shift(5).ffill()
+    d["BullDivExt"] = ((l <= d["Low20_prev"] * 1.01)
+                       & ((d["RSI"] > rsi_prev_lo_ext + 3) | ((macd_prev_lo < 0) & (d["MACD_Hist"] > macd_prev_lo)))
+                       & (d["RSI"] < 50)).astype(float)                                             # 價創低、RSI或MACD柱墊高
+
+    # (G) 超跌回檔幅度（從波段高點回測的百分比）
+    peak250 = h.rolling(250, min_periods=60).max()
+    d["DrawdownPct"] = (c / peak250 - 1) * 100                                                    # 從 250 日高點的回落 %
+    d["DropFromPeak"] = (peak250 - c) / (peak250 + 1e-9) * 100                                    # 正值表示跌幅
+
+    # (H) 快速篩選條件（量化條件清單，可直接在篩選器使用）
+    bench_proxy = d["MA60"]                                                                        # 沒有大盤資料時用 60MA 代理
+    d["RS_3d"] = (c / c.shift(3) - 1)                                                              # 近 3 日漲跌幅（個股端，大盤比較在 compute_features 做）
     return d
 
 
@@ -983,6 +1051,10 @@ PANEL_FIELDS = [
     "K", "D", "MACD_Hist", "MFI", "CLV5", "CMF20", "AD_net20", "UDVR", "Close_loc", "Range5", "Low5",
     "High20_prev", "pct", "Ret20", "Ret60", "Ret120", "Hi250", "MF10", "TR10", "FR10",
     "SWL", "High60_prev", "Low60_prev", "Hi250p", "Low20_prev", "TopDiv", "Distr", "Surge",
+    "Hammer", "Engulf", "High3_prev", "BullDiv", "DryCnt5", "Dd60",
+    "CapitBlack", "CapitConfirm", "CapitVol", "GapDn", "IslandRev",
+    "MA5_TurnUp", "Bias60", "ExtrBias20", "ExtrBias60", "ResistAbsorb",
+    "KD_MidGold", "BullDivExt", "DrawdownPct", "DropFromPeak", "RS_3d",
 ]
 
 
@@ -1056,13 +1128,53 @@ def compute_features(P: dict, bench_close: pd.Series, groups: dict | None = None
     pullback = ((P["MA20_slope5"] > 0) & (P["Bias10"].abs() <= 2.0) & (P["RSI"] >= 42) & (P["RSI"] <= 62)
                 & (P["Volume"] < P["Vol_MA5"] * 0.9) & (C > P["MA20"])).astype(float)
     f["setup"] = np.maximum(breakout, 0.8 * pullback)
+    # ---- 深跌反彈：抗跌領頭(resil，只在大盤自 20 日高回落 ≥4% 時有值) 與 超跌反轉/換手(rebound) ----
+    b = bench_close.reindex(C.index).ffill()
+    idx_weak = ((b / b.rolling(20, min_periods=5).max() - 1) <= -0.04).astype(float)
+    ex5 = (C / C.shift(5) - 1).sub(b / b.shift(5) - 1, axis=0)                                  # 近 5 日相對大盤的超額報酬
+    hold_low = (P["Low"] > P["Low20_prev"]).astype(float)                                       # 沒有跌破前 20 日低點
+    above = ((C > P["MA20"]) | (C > P["MA60"])).astype(float)                                   # 守在月線或季線之上
+    # 增強：近 3 日跌幅小於大盤跌幅（相對強弱條件 1）
+    bench_3d = b / b.shift(3) - 1
+    stock_3d = C / C.shift(3) - 1
+    rs_3d_vs_bench = (stock_3d > bench_3d).astype(float)                                         # 個股 3 日跌幅 < 大盤
+    # 增強：率先站回關鍵均線
+    reclaim_ma = ((C > P["MA5"]) & (C > P["MA10"]) & (P["Volume"] > 1.2 * P["Vol_MA5"])).astype(float)
+    f["resil"] = (0.30 * ((ex5 + 0.01) / 0.06).clip(0, 1) + 0.20 * hold_low + 0.15 * above
+                  + 0.15 * rs_3d_vs_bench + 0.20 * reclaim_ma).mul(idx_weak, axis=0)
+
+    # --- 超跌反彈 rebound 進階：加入爆量長黑後確認、島狀反轉、KD中段金叉、短均線翻揚 ---
+    oversold = np.maximum(np.maximum(((-P["Bias20"] - 8) / 12).clip(0, 1), ((35 - P["RSI"]) / 20).clip(0, 1)),
+                          ((25 - P["K"]) / 15).clip(0, 1))                                      # 負乖離/RSI/KD 超賣
+    # 極端超賣加分（月線負乖離 < -15% 或季線 < -20%）
+    extr_os = np.maximum(P.get("ExtrBias20", oversold * 0), P.get("ExtrBias60", oversold * 0))
+    oversold = np.maximum(oversold, 0.8 * extr_os)
+
+    reversal = np.maximum(np.maximum(0.7 * P["Hammer"], 0.7 * P["Engulf"]),
+                          0.8 * ((C > P["MA5"]) & (C > P["High3_prev"])).astype(float))         # 錘子/吞噬/率先站回5MA且破3日高
+    # 新增：爆量長黑後確認（聯發科型態）+ 島狀反轉 + KD中段金叉
+    if "CapitConfirm" in P:
+        reversal = np.maximum(reversal, 0.9 * P["CapitConfirm"])                                  # 恐慌爆量後隔日確認 = 強信號
+    if "IslandRev" in P:
+        reversal = np.maximum(reversal, 0.85 * P["IslandRev"])                                    # 島狀反轉/缺口回補
+    if "KD_MidGold" in P:
+        reversal = np.maximum(reversal, 0.6 * P["KD_MidGold"])                                    # KD 50 附近金叉 = 不是超賣鈍化
+
+    vol_t = (P["Volume"] / P["Vol_MA5"] - 1).clip(0, 1)
+    capit = ((P["DryCnt5"] >= 3) & (P["Volume"] >= 1.5 * P["Vol_MA5"]) & (C > P["Open"])).astype(float)   # 窒息量後爆量換手
+    # 底部背離加強：使用擴展版（RSI + MACD 雙重背離）
+    bull_div = np.maximum(P["BullDiv"], P.get("BullDivExt", P["BullDiv"]))
+    s1 = oversold * (0.4 * reversal + 0.2 * vol_t + 0.2 * np.maximum(bull_div, capit)
+                     + 0.1 * P.get("MA5_TurnUp", reversal * 0) + 0.1 * P.get("ResistAbsorb", reversal * 0))
+    s2 = 0.8 * ((f["resil"] > 0.5) & (C > P["MA5"]) & (C > P["High3_prev"]) & (P["Volume"] >= 1.5 * P["Vol_MA5"])).astype(float)
+    f["rebound"] = np.maximum(s1, s2).clip(0, 1)
     return {k: v.astype(np.float32) for k, v in f.items()}
 
 
 def composite_score(feats: dict, preset: str) -> pd.DataFrame:
     w = PRESETS[preset]
     tot = sum(w.values())
-    return sum(feats[k] * v for k, v in w.items()) / tot * 100
+    return sum(feats[k] * v for k, v in w.items() if k in feats) / tot * 100
 
 
 def universe_masks(P: dict, flt: Filters):
@@ -1361,7 +1473,8 @@ def _x_at(A, d, j) -> dict:
 
 def simulate(eng: Engine, params: Params, start: int, end: int, max_pos: int = 4):
     """進場：隔日開盤。停損：結構破壞（或 ATR）。出場：TP1 分批 → 剩餘部位跌破 10MA / 追蹤停利；
-    另有 頂背離、高檔爆量長上影、月線連 2 日失守（均於收盤判定、次日開盤執行）。"""
+    另有 頂背離、高檔爆量長上影、月線連 2 日失守（均於收盤判定、次日開盤執行）。
+    反彈型（preset=反彈型）在空頭環境(lv==0)仍允許最多1檔小部位進場。"""
     A = eng.arr
     O, H, L, C, Cf, ATR = A["O"], A["H"], A["L"], A["C"], A["Cf"], A["ATR"]
     MA10, MA20, TD, DS = A["MA10"], A["MA20"], A["TOPDIV"], A["DISTR"]
@@ -1374,6 +1487,8 @@ def simulate(eng: Engine, params: Params, start: int, end: int, max_pos: int = 4
     expo, sleeve_days, lv0_days = [], 0, 0
     start, end = max(start, 1), min(end, len(eng.idx))
     sleeve_prev = None
+    is_rebound = params.preset == REBOUND or params.preset == "反彈型"
+    max_by_lvl = {0: (1 if is_rebound else 0), 1: 2, 2: 4}       # 反彈型空頭允許1檔
 
     def close_pos(p, d, px, reason, sleeve_on):
         nonlocal cash
@@ -1398,7 +1513,7 @@ def simulate(eng: Engine, params: Params, start: int, end: int, max_pos: int = 4
         lv0_days += (lv == 0)
 
         # 1) 開盤進場（訊號來自前一日收盤）；倉位 = min(主動額度/4, 風險預算/停損距離, 現金)
-        allowed = 0 if params.active <= 0 else min(max_pos, MAX_BY_LEVEL[lv])
+        allowed = 0 if params.active <= 0 else min(max_pos, max_by_lvl[lv])
         if len(pos) < allowed:
             held = {p["j"] for p in pos}
             for k in range(order.shape[1]):
@@ -2059,6 +2174,8 @@ def signal_quality(eng: Engine, preset: str, horizon: int = 10) -> dict:
 
 
 def score_calibration(eng: Engine, preset: str, horizon: int) -> pd.DataFrame:
+    if getattr(eng, "is_lite", False):
+        return eng.calib                    # 輕量引擎沒有完整歷史；校準表由排程預先算好
     fwd, S = _fwd(eng, horizon), eng.scores[preset]
     E = eng.elig & fwd.notna() & S.notna()
     df = pd.DataFrame({"score": S.where(E).stack(), "fwd": fwd.where(E).stack()}).dropna()
@@ -2444,8 +2561,8 @@ def save_learned_model(m: dict | None):
 
 def ensure_learned(eng: Engine, params: Params, fetch=None) -> Params:
     """參數若選了『學習型』，把已存的權重套到這個引擎；找不到就退回『均衡』，不會當掉。"""
-    if params.preset != LEARNED:
-        return params
+    if params.preset != LEARNED or getattr(eng, "is_lite", False):
+        return params                       # 輕量引擎的『學習型』分數已由排程算好
     try:
         m = json.loads(LEARNED_FILE.read_text(encoding="utf-8"))
     except Exception:
@@ -2589,7 +2706,7 @@ def get_ind_map(codes: list, market: dict, get_prices_fn) -> dict:
 def assemble_ctx(meta, market, names, eng, params, get_prices_fn, capital, risk_pct, chip_weight,
                  portfolio_rows, watch_codes, news_fn=None) -> dict:
     hold_codes = [str(r.get("code", "")).strip() for r in portfolio_rows]
-    ind_map = get_ind_map(hold_codes + list(watch_codes), market, get_prices_fn)
+    ind_map = get_ind_map_eng(eng, hold_codes + list(watch_codes), market, get_prices_fn)
     return dict(meta=meta, names=names, market=market, capital=capital, risk_pct=risk_pct,
                 portfolio=portfolio_rows, watch=list(watch_codes), ind_map=ind_map,
                 chip_fn=make_chip_fn(meta["chips"], chip_weight), news_fn=news_fn,
@@ -2819,6 +2936,137 @@ def write_latest_scan(eng, params, ctx, names, notes):
         pass
 
 
+# ----------------------------------------------------------------------------
+# 預先算好的網站資料：GitHub 排程把「最近 80 個交易日」的指標、分數、篩選結果存成一個小檔，
+# 網站只下載這個檔就能顯示全部頁面——不用自己抓價格、不用算指標、不用建引擎，所以快、也不吃記憶體。
+# ----------------------------------------------------------------------------
+LITE_ROWS = 80
+LITE_REQ = ("Open", "High", "Low", "Close", "Volume", "MA5", "MA10", "MA20", "MA60", "MA20_slope5", "Vol_MA5", "Vol_MA20",
+            "K", "D", "RSI", "MACD_Hist", "Bias5", "Bias20", "ATR", "Low5", "High20_prev", "pct")
+
+
+def export_lite(eng, params, ctx, names, market, meta) -> str:
+    n = LITE_ROWS
+    try:                                    # 讓『學習型』分數也是真的（不是預留的複本）
+        m = json.loads(LEARNED_FILE.read_text(encoding="utf-8"))
+        if list(m.get("names", [])) == list(FEAT_NAMES) and all(k in eng.F for k in FEAT_NAMES):
+            apply_learned(eng, m)
+    except Exception:
+        pass
+    z = {}
+    for k, df in eng.P.items():
+        z["P__" + k] = df.tail(n).to_numpy(np.float32)
+    for k, df in eng.feats.items():
+        z["F__" + k] = df.tail(5).to_numpy(np.float32)
+    for k, df in eng.scores.items():
+        z["S__" + k] = df.tail(n).to_numpy(np.float32)
+    for k, df in eng.elig_by_heat.items():
+        z["E__" + k] = df.tail(n).to_numpy(np.uint8)
+    z["liquid"] = eng.liquid.tail(n).to_numpy(np.uint8)
+    z["regime_lvl"] = np.asarray(eng.regime_lvl[-n:], dtype=np.int8)
+    z["breadth"] = eng.breadth.tail(n).to_numpy(np.float32)
+    z["bench"] = eng.bench_close.reindex(eng.idx).ffill().tail(n).to_numpy(np.float64)
+    z["sleeve"] = eng.sleeve.reindex(eng.idx).ffill().tail(n).to_numpy(np.float64)
+    path = STATE_DIR / "lite_bundle.npz"
+    np.savez_compressed(path, **z)
+    codes = set(eng.codes)
+    cands = latest_candidates(eng, params, top=30, exclude=ctx["punish"], chip_fn=ctx["chip_fn"], news_fn=ctx.get("news_fn"))
+    news = {c["code"]: dict(items=[dict(title=i["title"], link=i["link"], source=i.get("source", "")) for i in (c["news"].get("items") or [])])
+            for c in cands if c.get("news")}
+    try:
+        calib = score_calibration(eng, params.preset, params.hold)
+        calib = calib.reset_index().astype({calib.index.name or "index": str}).to_dict("records") if len(calib) else []
+    except Exception:
+        calib = []
+    ch = meta["chips"]
+    lm = dict(updated=now_tw().isoformat(timespec="seconds"), data_date=eng.idx[-1].strftime("%Y-%m-%d"),
+              dates=[d.strftime("%Y-%m-%d") for d in eng.idx[-n:]], codes=list(eng.codes),
+              groups={c: g for c, g in eng.groups.items() if c in codes}, costs=asdict(eng.costs), flt=asdict(eng.flt),
+              risk_frac=eng.risk_frac, capital=eng.capital, params=params.label(), preset=params.preset,
+              names={c: v for c, v in names.items()}, market={c: v for c, v in market.items()},
+              chips={c: [float(ch.loc[c, "foreign"]), float(ch.loc[c, "trust"]), float(ch.loc[c, "total"])]
+                     for c in eng.codes if c in ch.index},
+              rev={c: float(v) for c, v in meta["rev"].items() if c in codes and pd.notna(v)},
+              punish=sorted(meta["punish"]), notice=sorted(meta["notice"]), calib=_clean(calib), news=_clean(news),
+              bundle_bytes=path.stat().st_size)
+    (STATE_DIR / "lite_meta.json").write_text(json.dumps(_clean(lm), ensure_ascii=False), encoding="utf-8")
+    return f"lite_bundle.npz {path.stat().st_size / 1e6:.1f} MB（{len(eng.codes)} 檔 × 最近 {n} 日）"
+
+
+class LiteEngine:
+    """網站專用輕量引擎：只含最近 80 個交易日的特徵/分數/篩選結果（由排程預先算好）。
+    網頁需要的功能（推薦、族群排行、篩選器、持股健檢、訊號預覽）都能用；需要完整歷史的回測/驗證則由排程或網站另外執行。"""
+    is_lite = True
+
+    def __init__(self, z, meta: dict):
+        idx = pd.DatetimeIndex(pd.to_datetime(meta["dates"]))
+        self.idx, self.codes, self.groups = idx, list(meta["codes"]), dict(meta.get("groups", {}))
+        mk = lambda a: pd.DataFrame(a, index=idx[-len(a):], columns=self.codes)
+        self.P = {k[3:]: mk(z[k]) for k in z.files if k.startswith("P__")}
+        self.feats = {k[3:]: mk(z[k]) for k in z.files if k.startswith("F__")}
+        self.scores = {k[3:]: mk(z[k]) for k in z.files if k.startswith("S__")}
+        self.elig_by_heat = {k[3:]: mk(z[k]).astype(bool) for k in z.files if k.startswith("E__")}
+        self.elig = self.elig_by_heat.get("中") if "中" in self.elig_by_heat else next(iter(self.elig_by_heat.values()))
+        self.liquid = mk(z["liquid"]).astype(bool)
+        self.regime_lvl = z["regime_lvl"].astype(int)
+        self.regime = self.regime_lvl > 0
+        self.breadth = pd.Series(z["breadth"], index=idx[-len(z["breadth"]):])
+        self.bench_close = pd.Series(z["bench"], index=idx[-len(z["bench"]):])
+        self.sleeve = pd.Series(z["sleeve"], index=idx[-len(z["sleeve"]):])
+        self.costs, self.flt = Costs(**meta["costs"]), Filters(**meta["flt"])
+        self.risk_frac, self.capital = meta.get("risk_frac", 0.015), meta.get("capital", 1_000_000.0)
+        self.F, self._memo = {}, {}
+        cal = meta.get("calib") or []
+        self.calib = pd.DataFrame(cal).set_index(pd.DataFrame(cal).columns[0]) if cal else pd.DataFrame()
+
+
+def lite_meta_to_meta(m: dict) -> dict:
+    """把預先算好的檔案還原成網站原本使用的 meta 結構（名稱、籌碼、營收、處置/注意股）。"""
+    names, market, groups = m.get("names", {}), m.get("market", {}), m.get("groups", {})
+    uni = pd.DataFrame([dict(code=c, name=names.get(c, c), market=market.get(c, "TW"), industry=groups.get(c, "")) for c in m["codes"]])
+    ch = m.get("chips") or {}
+    chips = (pd.DataFrame.from_dict(ch, orient="index", columns=["foreign", "trust", "total"]).astype(float)
+             if ch else pd.DataFrame(columns=["foreign", "trust", "total"]))
+    return dict(uni=uni, turn=pd.Series(dtype=float), names=names, markets=market, chips=chips, chip_days=[],
+                rev=pd.Series(m.get("rev") or {}, dtype=float), punish=set(m.get("punish") or []),
+                notice=set(m.get("notice") or []), official=pd.Series(dtype=float), msgs=[])
+
+
+def ind_from_tails(eng, code: str):
+    """從輕量引擎的『最近 80 日』直接取得單檔指標表；欄位不齊就回 None，由呼叫端改用下載。"""
+    if code not in eng.codes or not all(k in eng.P for k in LITE_REQ):
+        return None
+    d = pd.DataFrame({k: v[code] for k, v in eng.P.items()}).dropna(subset=["Close"])
+    return d if len(d) >= 65 else None
+
+
+def get_ind_map_eng(eng, codes, market, get_prices_fn) -> dict:
+    codes = [c for c in dict.fromkeys(str(c).strip() for c in codes) if c]
+    out = {}
+    if getattr(eng, "is_lite", False):
+        for c in codes:
+            d = ind_from_tails(eng, c)
+            if d is not None:
+                out[c] = d
+    rest = [c for c in codes if c not in out]
+    if rest:
+        out.update(get_ind_map(rest, market, get_prices_fn))
+    return out
+
+
+def fetch_state_bytes(name: str):
+    try:
+        return (STATE_DIR / name).read_bytes()
+    except Exception:
+        pass
+    base = get_secret("STATE_BASE_URL")
+    if base:
+        r = requests.get(base.rstrip("/") + "/" + name, timeout=60)
+        r.raise_for_status()
+        return r.content
+    raise FileNotFoundError(name)
+
+
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
 
 
@@ -2862,6 +3110,10 @@ def run_scan_cycle(get_prices_fn, meta_fn, inst_fn, news_loader):
     except Exception:
         pass
     write_latest_scan(eng, params, ctx, names, notes)
+    try:
+        notes.append("預先算好的網站資料：" + export_lite(eng, params, ctx, names, market, meta))
+    except Exception as e:
+        notes.append(f"預先算好的網站資料匯出失敗（不影響推播）：{e}")
     print(f"[{now:%m-%d %H:%M}] 股票池 {len(eng.codes)} 檔｜資料日 {eng.idx[-1]:%Y-%m-%d}｜"
           f"新訊號 {len(fresh)} 則｜{msg}｜記憶體 {rss_mb():.0f}MB", flush=True)
     for m in notes:
@@ -3118,6 +3370,9 @@ sb.markdown("### 交易成本")
 fee_disc = sb.slider("手續費折扣（0.6 = 6折）", 0.2, 1.0, 0.6, 0.02)
 slip_pct = sb.slider("單邊滑價 (%)", 0.0, 0.5, 0.10, 0.05)
 sb.markdown("### 股票池來源（兩階段，省記憶體）")
+use_lite = sb.checkbox("⚡ 使用排程預先算好的資料（最快、最省記憶體，股票池照排程的大池）", value=True,
+                       help="網站直接讀 GitHub 排程算好的結果（全部頁面都能用），不用自己下載價格和計算。"
+                            "取消勾選才會由網站自己下載與計算（較慢、較吃記憶體，股票池受下面設定限制）。")
 use_short = sb.checkbox("只分析『排程掃描挑出的強勢名單』（約200檔）", value=not BIG,
                         help="第一階段由 GitHub Actions 掃全市場，挑出技術分最高的強勢股；網站只載入這份名單做細部分析。沒有掃描結果時自動改用成交值前 N 檔。")
 extra_txt = sb.text_area("額外加入代碼（可貼上你在 Yahoo／玩股網／Goodinfo 等網站選出的股票）", value="", height=70,
@@ -3204,6 +3459,20 @@ def news_store() -> dict:
     return {}
 
 
+@st.cache_data(ttl=120, max_entries=2, show_spinner=False)
+def lite_meta_cached():
+    return fetch_state_json("lite_meta.json")
+
+
+@st.cache_resource(max_entries=1, show_spinner=False)
+def lite_engine_cached(updated: str):
+    meta_l = fetch_state_json("lite_meta.json")
+    raw = fetch_state_bytes("lite_bundle.npz")
+    if not meta_l or meta_l.get("updated") != updated or len(raw) != int(meta_l.get("bundle_bytes", -1)):
+        raise RuntimeError("資料檔還在更新中（兩個檔案版本不一致），稍後自動重試")
+    return LiteEngine(np.load(io.BytesIO(raw), allow_pickle=False), meta_l), meta_l
+
+
 @st.cache_data(ttl=600, max_entries=4, show_spinner=False)
 def remote_state(name: str):
     return fetch_state_json(name)
@@ -3235,22 +3504,43 @@ page = st.radio("頁面", PAGES, horizontal=True, label_visibility="collapsed", 
 
 if page != PAGES[5]:
     bucket = bucket_key()
-    try:
-        with st.spinner("更新資料中（首次約 1~3 分鐘；引擎一天只重建 2~3 次，盤中只更新持股/自選股等小資料）…"):
-            _extra = tuple(c for c in re.split(r"[\s,，、]+", extra_txt) if re.fullmatch(r"\d{4}", c))
-            _mine = tuple(str(r.get("code") or "").strip() for r in (st.session_state.get("portfolio") or load_portfolio())) \
-                + tuple(st.session_state.get("watchlist") or load_watchlist())
-            _sl = shortlist_cached(engine_key(use_intraday)) if use_short else ()
-            _only = tuple(dict.fromkeys(_sl + _extra + _mine)) if _sl else ()
+    _lm = lite_meta_cached() if use_lite else None
+    _lite_ok = False
+    if _lm:
+        try:
             _tb = time.perf_counter()
-            eng, bench_df, eng_notes = build_engine(engine_key(use_intraday), n_universe, tuple(excl), min_price, min_turn_yi,
-                                                    min_amp, bias5_max, bias20_max, fee_disc, slip_pct, risk_pct, use_intraday,
-                                                    only_t=_only, extra_t=(() if _only else _extra))
-            meta = load_meta(now_tw().strftime("%Y-%m-%d-%H"))
-            _T_ENGINE = time.perf_counter() - _tb
-    except Exception as e:
-        st.error(f"資料載入失敗：{e}")
-        st.stop()
+            eng, _lmeta = lite_engine_cached(_lm["updated"])
+            meta = lite_meta_to_meta(_lmeta)
+            bench_df, _T_ENGINE = None, time.perf_counter() - _tb
+            eng_notes = [f"⚡ 預先算好的資料：GitHub 排程於 {str(_lmeta['updated'])[5:16].replace('T', ' ')} 更新，資料日 {_lmeta['data_date']}，"
+                         f"股票池 {len(eng.codes)} 檔；使用參數 {_lmeta.get('params', '')}。網站不用自己下載價格或重算指標。"]
+            _store = news_store()
+            for _c, _d in (_lmeta.get("news") or {}).items():
+                _store.setdefault(_c, (_d.get("items", []), time.time()))
+            _lite_ok = True
+        except Exception as e:
+            st.warning(f"預先算好的資料暫時讀不到（{e}），這次改由網站自己計算。")
+    if not _lite_ok:
+        try:
+            with st.spinner("更新資料中（首次約 1~3 分鐘；引擎一天只重建 2~3 次，盤中只更新持股/自選股等小資料）…"):
+                _extra = tuple(c for c in re.split(r"[\s,，、]+", extra_txt) if re.fullmatch(r"\d{4}", c))
+                _mine = tuple(str(r.get("code") or "").strip() for r in (st.session_state.get("portfolio") or load_portfolio())) \
+                    + tuple(st.session_state.get("watchlist") or load_watchlist())
+                _sl = shortlist_cached(engine_key(use_intraday)) if use_short else ()
+                _only = tuple(dict.fromkeys(_sl + _extra + _mine)) if _sl else ()
+                _tb = time.perf_counter()
+                eng, bench_df, eng_notes = build_engine(engine_key(use_intraday), n_universe, tuple(excl), min_price, min_turn_yi,
+                                                        min_amp, bias5_max, bias20_max, fee_disc, slip_pct, risk_pct, use_intraday,
+                                                        only_t=_only, extra_t=(() if _only else _extra))
+                meta = load_meta(now_tw().strftime("%Y-%m-%d-%H"))
+                _T_ENGINE = time.perf_counter() - _tb
+        except Exception as e:
+            st.error(f"資料載入失敗：{e}")
+            st.info("這通常是 Yahoo（yfinance）暫時擋住了網站的連線。**建議改用「預先算好的資料」**，網站就完全不用連 Yahoo：\n\n"
+                    "1. GitHub → Actions → scan → Run workflow（勾選強制掃描），等它跑完；\n"
+                    "2. Streamlit → Manage app → Settings → Secrets 確認有 `STATE_BASE_URL`；\n"
+                    "3. 回到網站，側邊欄勾選「⚡ 使用排程預先算好的資料」，重新整理。")
+            st.stop()
     st.session_state["loaded_bucket"] = bucket
 
     NAMES, ALL_MARKET = build_name_market(meta)
@@ -3593,7 +3883,7 @@ if page == PAGES[2]:
     items = ([(c, n, t) for v in SECTORS.values() for c, n, t in v if tag_pick in t] if tag_pick != "—" else SECTORS[sec])
     seen = set()
     items = [i for i in items if not (i[0] in seen or seen.add(i[0]))]
-    sec_ind = get_ind_map([c for c, _, _ in items], ALL_MARKET, get_px)
+    sec_ind = get_ind_map_eng(eng, [c for c, _, _ in items], ALL_MARKET, get_px)
     show_mini = st.checkbox("顯示K線小圖（取消勾選可讓頁面更快）", value=True, key="show_mini")
     for i in range(0, len(items), 2):
         cols = st.columns(2)
